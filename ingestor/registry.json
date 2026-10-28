@@ -93,14 +93,14 @@
   },
   "binance-open-interest": {
     "repo": "https://github.com/fdguuwzj/duckport-binance-open-interest.git",
-    "description": "Binance USD-M open-interest ingestor (5m history or 1m snapshot)",
+    "description": "Binance USD-M open-interest ingestor (5m K-line labels, or 1m snapshot)",
     "exec": "binance-open-interest",
     "default_instance": "binance-open-interest-5m",
     "config": [
       {
         "name": "OI_MODE",
-        "label": "采集模式 history/snapshot",
-        "default": "history"
+        "label": "采集模式 5m/snapshot",
+        "default": "5m"
       },
       {
         "name": "BACKFILL_DAYS",
@@ -113,14 +113,9 @@
         "default": "8"
       },
       {
-        "name": "REQUEST_INTERVAL_SECONDS",
-        "label": "请求间隔秒数",
-        "default": "0.34"
-      },
-      {
-        "name": "POLL_DELAY_SECONDS",
-        "label": "周期延迟秒数",
-        "default": "30"
+        "name": "HIST_REQUESTS_PER_5M",
+        "label": "历史接口每 5 分钟请求上限",
+        "default": "900"
       },
       {
         "name": "PROXY_URL",
