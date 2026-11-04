@@ -405,25 +405,22 @@ def test_gap_after_target_watermark_is_rejected():
     src = catalog(["usdt_perp_1m"], columns, {"usdt_perp_1m": wm(upper)})
 
     stale = build_plans(src, catalog(["usdt_perp_1m"], columns, {"usdt_perp_1m": wm(T0)}), None)
-    rejected = check_gaps(source, stale, False)[0]
+    rejected = check_gaps(source, stale)[0]
     assert rejected.action == "reject"
-    assert any("2024-03-01 00:00:00" in item and "--allow-gap" in item for item in rejected.differences)
-    allowed = check_gaps(source, stale, True)[0]
-    assert allowed.action == "copy" and allowed.lower == T0
-    assert any("--allow-gap" in note for note in allowed.notes)
+    assert any("2024-03-01 00:00:00" in item and "补齐" in item for item in rejected.differences)
 
     # The source still holds the target watermark row: no gap.
     covered = catalog(["usdt_perp_1m"], columns, {"usdt_perp_1m": wm(datetime(2024, 3, 1, 0, 30))})
-    assert check_gaps(source, build_plans(src, covered, None), False)[0].action == "copy"
+    assert check_gaps(source, build_plans(src, covered, None))[0].action == "copy"
     # No target watermark, or a table being created: nothing to compare against.
-    assert check_gaps(source, build_plans(src, catalog(["usdt_perp_1m"], columns, {}), None), False)[0].action == "copy"
-    assert check_gaps(source, build_plans(src, catalog([], {}), ["usdt_perp_1m"]), False)[0].action == "create"
+    assert check_gaps(source, build_plans(src, catalog(["usdt_perp_1m"], columns, {}), None))[0].action == "copy"
+    assert check_gaps(source, build_plans(src, catalog([], {}), ["usdt_perp_1m"]))[0].action == "create"
 
     class Down:
         def query(self, sql):
             raise flight.FlightUnavailableError("source went away")
 
-    failed = check_gaps(Down(), stale, False)[0]
+    failed = check_gaps(Down(), stale)[0]
     assert failed.action == "reject" and "无法检查缺口" in failed.reason
 
 
