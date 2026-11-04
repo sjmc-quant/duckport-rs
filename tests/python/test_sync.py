@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from duckport_flight import flight_client_kwargs
 from reconcile.specs import TableSpec
 from sync import (
-    Catalog, Column, Plan, build_plans, compare_columns, create_table_sql, initial_window,
+    Catalog, Column, Plan, build_plans, check_gaps, compare_columns, create_table_sql, initial_window,
     is_safe_default, iter_batches, merge_sql, page_rows_for, shrink_window, watermark_sql,
 )
 
@@ -358,6 +358,9 @@ class _DuckSource:
         result = self.con.execute(sql).arrow()
         return result.read_all() if hasattr(result, "read_all") else result
 
+    def query(self, sql):
+        return self.query_arrow(sql).to_pylist()
+
 
 def test_keyset_pages_read_every_row():
     import duckdb
@@ -386,6 +389,44 @@ def test_keyset_pages_read_every_row():
     assert len(pairs) == 1000 and len(set(pairs)) == 1000
 
 
+def test_gap_after_target_watermark_is_rejected():
+    import duckdb
+    import pyarrow.flight as flight
+    con = duckdb.connect()
+    con.execute("CREATE SCHEMA data")
+    # Source retention kept only March onward.
+    con.execute(
+        "CREATE TABLE data.usdt_perp_1m AS SELECT TIMESTAMP '2024-03-01' + to_minutes(i::BIGINT) AS open_time, "
+        "'A' AS symbol, 1.0::DOUBLE AS close FROM range(100) r(i)"
+    )
+    source = _DuckSource(con)
+    columns = {"usdt_perp_1m": kline_cols()}
+    upper = datetime(2024, 3, 1, 1)
+    src = catalog(["usdt_perp_1m"], columns, {"usdt_perp_1m": wm(upper)})
+
+    stale = build_plans(src, catalog(["usdt_perp_1m"], columns, {"usdt_perp_1m": wm(T0)}), None)
+    rejected = check_gaps(source, stale, False)[0]
+    assert rejected.action == "reject"
+    assert any("2024-03-01 00:00:00" in item and "--allow-gap" in item for item in rejected.differences)
+    allowed = check_gaps(source, stale, True)[0]
+    assert allowed.action == "copy" and allowed.lower == T0
+    assert any("--allow-gap" in note for note in allowed.notes)
+
+    # The source still holds the target watermark row: no gap.
+    covered = catalog(["usdt_perp_1m"], columns, {"usdt_perp_1m": wm(datetime(2024, 3, 1, 0, 30))})
+    assert check_gaps(source, build_plans(src, covered, None), False)[0].action == "copy"
+    # No target watermark, or a table being created: nothing to compare against.
+    assert check_gaps(source, build_plans(src, catalog(["usdt_perp_1m"], columns, {}), None), False)[0].action == "copy"
+    assert check_gaps(source, build_plans(src, catalog([], {}), ["usdt_perp_1m"]), False)[0].action == "create"
+
+    class Down:
+        def query(self, sql):
+            raise flight.FlightUnavailableError("source went away")
+
+    failed = check_gaps(Down(), stale, False)[0]
+    assert failed.action == "reject" and "无法检查缺口" in failed.reason
+
+
 def main():
     test_flight_token_override()
     test_column_order_type_and_nulls()
@@ -399,6 +440,7 @@ def main():
     test_merge_sql_window_and_duckdb()
     test_mode2_keeps_column_defaults()
     test_keyset_pages_read_every_row()
+    test_gap_after_target_watermark_is_rejected()
     print("ok")
 
 

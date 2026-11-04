@@ -13,6 +13,10 @@ Two modes, both read-only on the source:
         fill it up to the source watermark. An existing table is aligned the
         same way as the first mode.
 
+An existing table is rejected when the source keeps no row at or before the
+target watermark (retention, or a later start): moving the watermark would
+hide the span in between. ``--allow-gap`` copies it anyway.
+
 Run ``duckport sync`` on the target machine. Writes are refused from the
 public internet. Exit 0 when nothing was rejected, 1 when a table was rejected
 or a copy failed, 2 when the command itself could not run.
@@ -26,7 +30,7 @@ import math
 import os
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 
 import pyarrow as pa
@@ -594,6 +598,47 @@ def describe(plan):
     return f"复制  {left} 之后到 {fmt(plan.upper)}"
 
 
+def find_gap(source, plan):
+    """First source row after the target watermark when the source keeps nothing
+    at or before it, else None. The watermark only moves forward, so such a span
+    would never be filled afterwards."""
+    if plan.action != "copy" or plan.lower is None or not plan.time_column:
+        return None
+    column = q(plan.time_column)
+    table = f"data.{q(plan.name)}"
+    if source.query(f"SELECT 1 AS hit FROM {table} WHERE {column} <= {sql_literal(plan.lower)} LIMIT 1"):
+        return None
+    preds = time_predicates(plan.time_column, plan.lower, plan.upper)
+    rows = source.query(
+        f"SELECT {column} AS first FROM {table} WHERE {' AND '.join(preds)} ORDER BY {column} LIMIT 1"
+    )
+    if not rows or rows[0].get("first") is None:
+        return None
+    return as_naive(rows[0]["first"])
+
+
+def check_gaps(source, plans, allow_gap):
+    """Reject copy plans whose range starts after the target watermark, unless allowed."""
+    checked = []
+    for plan in plans:
+        try:
+            first = find_gap(source, plan)
+        except (flight.FlightError, pa.ArrowException, OSError, ValueError) as exc:
+            checked.append(_reject(plan.name, f"无法检查缺口：{str(exc).splitlines()[0]}", notes=plan.notes))
+            continue
+        if first is None:
+            checked.append(plan)
+            continue
+        gap = f"源上最早只有 {fmt(first)}，目标水位 {fmt(plan.lower)}，中间这段源上没有"
+        if allow_gap:
+            checked.append(replace(plan, notes=plan.notes + (gap + "；已按 --allow-gap 继续，目标水位会越过这段",)))
+        else:
+            checked.append(_reject(
+                plan.name, "目标水位之后有缺口", (gap + "；先在目标补齐这段，或加 --allow-gap",), plan.notes,
+            ))
+    return checked
+
+
 def print_plans(plans):
     if not plans:
         print("没有需要处理的表")
@@ -893,6 +938,7 @@ def run(args):
     source_catalog = load_catalog(source)
     target_catalog = load_catalog(target)
     plans = build_plans(source_catalog, target_catalog, args.table or None)
+    plans = check_gaps(source, plans, args.allow_gap)
     print_plans(plans)
     counts = summarize(plans)
     print(
@@ -939,6 +985,8 @@ def main(argv=None):
     parser.add_argument("--addr", default="127.0.0.1:50051", help="target duckport, usually the local server")
     parser.add_argument("--table", action="append", default=[], help="source table to create or align; repeatable")
     parser.add_argument("--with-retention", action="store_true", help="copy retention_policy rows for synced tables")
+    parser.add_argument("--allow-gap", action="store_true",
+                        help="copy even when the source keeps no row at or before the target watermark")
     parser.add_argument("--dry-run", action="store_true", help="print the plan only")
     parser.add_argument("--preflight", action="store_true", help="print the plan only; used by the duckport CLI")
     parser.add_argument("--yes", action="store_true", help="do not ask before writing")

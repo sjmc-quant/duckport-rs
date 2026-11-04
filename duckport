@@ -1776,7 +1776,7 @@ cmd_sync() {
   local py status
   local -a pass=()
   if [[ $# -eq 0 ]]; then
-    echo -e "${RED}用法：duckport sync --from HOST:PORT [--from-token TOKEN] [--table 表名 ...] [--with-retention] [--dry-run] [--yes]${NC}"
+    echo -e "${RED}用法：duckport sync --from HOST:PORT [--from-token TOKEN] [--table 表名 ...] [--with-retention] [--allow-gap] [--dry-run] [--yes]${NC}"
     exit 2
   fi
   while [[ $# -gt 0 ]]; do
@@ -1799,11 +1799,12 @@ cmd_sync() {
         pass+=("$1" "$2")
         shift
         ;;
-      --with-retention) pass+=("$1") ;;
+      --with-retention|--allow-gap) pass+=("$1") ;;
       -h|--help)
-        echo "用法：duckport sync --from HOST:PORT [--from-token TOKEN] [--table 表名 ...] [--with-retention] [--dry-run] [--yes]"
+        echo "用法：duckport sync --from HOST:PORT [--from-token TOKEN] [--table 表名 ...] [--with-retention] [--allow-gap] [--dry-run] [--yes]"
         echo "  不带 --table：追平两边都有、且列结构一致的表的水位"
         echo "  --table：指定源表；目标没有这张表时按源结构创建"
+        echo "  --allow-gap：源上已没有目标水位及之前的数据时仍然复制（默认拒绝，否则水位会越过缺口）"
         return 0
         ;;
       *)
