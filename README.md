@@ -186,6 +186,8 @@ duckport status                     # 查看服务状态和数据水位
 duckport config binance-5m          # 编辑实例配置文件
 duckport logs binance-5m            # 实时查看日志
 duckport loadhist binance-5m        # 补历史数据
+duckport sync --from HOST:PORT       # 追平两边都有、且列结构一致的表的水位
+duckport sync --from HOST:PORT --table usdt_perp_1m  # 指定源表；目标没有则建表
 duckport retention set usdt_perp_1m 120   # 只保留最近 120 天（需 DUCKPORT_RETENTION_ENABLED=true）
 duckport retention status           # 保留策略与最近一次执行结果
 sudo duckport doctor                # 只读：对照当前版本的期望状态检查库、系统表和插件版本（--deep 全表查重，--json）

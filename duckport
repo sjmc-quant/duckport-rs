@@ -13,6 +13,8 @@
 #   duckport logs    <实例>|server|all   # 实时日志
 #   duckport update  <实例名> [--proxy URL]  # 更新插件（自动判断本地/GitHub）
 #   duckport loadhist <实例> [参数...]   # 补历史数据（参数传给插件的 loadhist）
+#   duckport sync --from HOST:PORT       # 从另一台 duckport 追平已有表的水位
+#   duckport sync --from HOST:PORT --table 表  # 指定源表，目标没有则建表
 #   duckport upgrade [--proxy URL]       # 升级：服务端 → 插件 → 数据对齐（--plan 只看计划）
 #   duckport upgrade --data              # 只做数据对齐，含压缩（--no-compact、--finalize、--rollback）
 #   duckport upgrade --compact           # 只做压缩：重建已完成但空间还没还给磁盘时
@@ -1766,6 +1768,105 @@ _compact_restore() {
   fi
 }
 
+# ─── sync ─────────────────────────────────────────────────────────────────────
+
+# 从另一台 duckport 拉取。先只读预检；有表要写时才停本机 ingestor。
+cmd_sync() {
+  local dry=0 yes=0 has_from=0 port rc=0 actions=0
+  local py status
+  local -a pass=()
+  if [[ $# -eq 0 ]]; then
+    echo -e "${RED}用法：duckport sync --from HOST:PORT [--from-token TOKEN] [--table 表名 ...] [--with-retention] [--dry-run] [--yes]${NC}"
+    exit 2
+  fi
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry=1 ;;
+      --yes) yes=1 ;;
+      --from)
+        [[ $# -ge 2 ]] || { echo -e "${RED}--from 需要 HOST:PORT${NC}"; exit 2; }
+        has_from=1
+        pass+=("$1" "$2")
+        shift
+        ;;
+      --from-token)
+        [[ $# -ge 2 ]] || { echo -e "${RED}--from-token 需要令牌${NC}"; exit 2; }
+        export DUCKPORT_SYNC_FROM_TOKEN="$2"
+        shift
+        ;;
+      --table|--addr)
+        [[ $# -ge 2 ]] || { echo -e "${RED}$1 缺少参数${NC}"; exit 2; }
+        pass+=("$1" "$2")
+        shift
+        ;;
+      --with-retention) pass+=("$1") ;;
+      -h|--help)
+        echo "用法：duckport sync --from HOST:PORT [--from-token TOKEN] [--table 表名 ...] [--with-retention] [--dry-run] [--yes]"
+        echo "  不带 --table：追平两边都有、且列结构一致的表的水位"
+        echo "  --table：指定源表；目标没有这张表时按源结构创建"
+        return 0
+        ;;
+      *)
+        echo -e "${RED}未知参数：$1${NC}"
+        exit 2
+        ;;
+    esac
+    shift
+  done
+  [[ $has_from -eq 1 ]] || { echo -e "${RED}需要 --from HOST:PORT${NC}"; exit 2; }
+  _scripts_readable || { _scripts_unreadable_hint; exit 2; }
+  port=$(_server_port)
+  nc -z localhost "$port" 2>/dev/null || { echo -e "${RED}duckport-server 未监听 :${port}${NC}"; exit 2; }
+  py=$(_flight_python)
+  pass+=("--addr" "127.0.0.1:$port")
+
+  if [[ $dry -eq 1 ]]; then
+    set +e
+    "$py" "$REPO_DIR/scripts/sync.py" "${pass[@]}" --dry-run
+    rc=$?
+    set -e
+    return $rc
+  fi
+
+  status=$(mktemp)
+  set +e
+  "$py" "$REPO_DIR/scripts/sync.py" "${pass[@]}" --preflight --status-file "$status"
+  rc=$?
+  set -e
+  if [[ $rc -eq 2 || ! -s "$status" ]]; then
+    rm -f "$status"
+    return $rc
+  fi
+  actions=$("$py" -c 'import json,sys; print(json.load(open(sys.argv[1]))["actions"])' "$status")
+  rm -f "$status"
+  if [[ "$actions" == "0" ]]; then
+    return $rc
+  fi
+
+  _require_root
+  if [[ $yes -eq 0 ]]; then
+    if [[ -t 0 ]]; then
+      local ans
+      read -r -p "将停止本机 ingestor 并同步 ${actions} 张表，继续？[y/N] " ans
+      [[ "$ans" =~ ^[Yy]$ ]] || { echo "已取消，ingestor 未停止"; return 0; }
+    else
+      echo -e "${RED}非交互终端请加 --yes${NC}"
+      return 2
+    fi
+  fi
+
+  trap _start_stopped_ingestors EXIT
+  echo -e "  ${YELLOW}⚠ 停止 ingestor，避免和同步同时写这些表${NC}"
+  _stop_running_ingestors
+  set +e
+  "$py" "$REPO_DIR/scripts/sync.py" "${pass[@]}" --yes
+  rc=$?
+  set -e
+  _start_stopped_ingestors
+  trap - EXIT
+  return $rc
+}
+
 # ─── help ─────────────────────────────────────────────────────────────────────
 
 cmd_help() {
@@ -1788,6 +1889,8 @@ ${BOLD}服务控制：${NC}
 
 ${BOLD}数据操作：${NC}
   duckport ${CYAN}loadhist${NC} <实例名>              补历史数据（必须指定实例）
+  duckport ${CYAN}sync${NC} --from HOST:PORT          追平两边都有、且列结构一致的表的水位
+  duckport ${CYAN}sync${NC} --from HOST:PORT --table 表  指定源表；目标没有则按源结构建表
   duckport ${CYAN}retention${NC} status               保留策略与最近一次执行结果
   duckport ${CYAN}retention${NC} set <表> <天数>       设置保留天数（--archive-dir DIR 先归档再删）
   duckport ${CYAN}retention${NC} disable <表>          停用某张表的策略
@@ -1814,6 +1917,7 @@ ${BOLD}示例：${NC}
   duckport start binance-5m           # 启动单个实例
   duckport logs binance-5m            # 查看该实例日志
   duckport loadhist binance-5m        # 补历史数据；插件参数跟在实例名后面
+  duckport sync --from 10.0.0.8:8815  # 追平本机已有表的水位；--table 表名 可建缺失表
 "
 }
 
@@ -1834,6 +1938,7 @@ case "$CMD" in
   restart)  cmd_restart "${1:-all}" ;;
   logs)     cmd_logs    "${1:-}" ;;
   loadhist) cmd_loadhist "$@" ;;
+  sync)     cmd_sync "$@" ;;
   retention) cmd_retention "$@" ;;
   doctor)   cmd_doctor "$@" ;;
   upgrade)  cmd_upgrade "$@" ;;
