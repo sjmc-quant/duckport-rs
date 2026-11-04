@@ -17,6 +17,9 @@ An existing table is rejected when the source keeps no row at or before the
 target watermark (retention, or a later start): moving the watermark would
 hide the span in between. ``--allow-gap`` copies it anyway.
 
+Only rows, the watermark, the table spec and the write mode are copied. The
+source's retention policy is not: the target keeps its own.
+
 Run ``duckport sync`` on the target machine. Writes are refused from the
 public internet. Exit 0 when nothing was rejected, 1 when a table was rejected
 or a copy failed, 2 when the command itself could not run.
@@ -85,7 +88,6 @@ class Catalog:
     write_modes: dict = field(default_factory=dict)
     keys: dict = field(default_factory=dict)
     kline_interval: str | None = None
-    retention: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -571,20 +573,6 @@ def write_mode_sql(plan):
     )]
 
 
-def retention_sql(table, row):
-    archive = row.get("archive_dir")
-    enabled = row.get("enabled")
-    enabled_sql = "TRUE" if enabled is None or bool(enabled) else "FALSE"
-    return (
-        "INSERT INTO data.retention_policy (table_name, keep_days, batch_days, archive_dir, enabled, updated_at) "
-        f"VALUES ({text(table)}, {int(row['keep_days'])}, {int(row.get('batch_days') or 1)}, "
-        f"{'NULL' if archive is None else text(str(archive))}, {enabled_sql}, CURRENT_TIMESTAMP) "
-        "ON CONFLICT (table_name) DO UPDATE SET keep_days = excluded.keep_days, "
-        "batch_days = excluded.batch_days, archive_dir = excluded.archive_dir, "
-        "enabled = excluded.enabled, updated_at = CURRENT_TIMESTAMP"
-    )
-
-
 def describe(plan):
     if plan.action == "reject":
         return "拒绝  " + plan.reason
@@ -700,13 +688,6 @@ def load_catalog(dp) -> Catalog:
                 catalog.write_modes[key.split(":", 1)[1]] = row.get("value")
             elif key == "kline_interval":
                 catalog.kline_interval = row.get("value")
-    if "retention_policy" in catalog.tables:
-        rows = try_query(
-            dp,
-            "SELECT table_name, keep_days, batch_days, archive_dir, enabled FROM data.retention_policy",
-        )
-        if rows:
-            catalog.retention = {row["table_name"]: row for row in rows}
     constraints = try_query(
         dp,
         "SELECT table_name, constraint_type FROM duckdb_constraints() "
@@ -842,7 +823,7 @@ def iter_batches(source, plan, page_rows):
         cursor += used
 
 
-def apply_plan(source, target, plan, with_retention, source_catalog):
+def apply_plan(source, target, plan):
     staging = f"_sync_{plan.name}"
     staging_sql_name = f"main.{q(staging)}"
     bounds = []
@@ -878,8 +859,6 @@ def apply_plan(source, target, plan, with_retention, source_catalog):
             meta.append(spec_upsert_sql(plan.spec_row))
         meta.extend(write_mode_sql(plan))
         meta.extend(watermark_sql(plan))
-        if with_retention and plan.name in source_catalog.retention:
-            meta.append(retention_sql(plan.name, source_catalog.retention[plan.name]))
         if meta:
             target.transaction(meta)
     finally:
@@ -913,18 +892,6 @@ def kline_interval_sql(source, target, done_names):
     )]
 
 
-def print_retention(source, names, copied):
-    for name in names:
-        row = source.retention.get(name)
-        if not row:
-            continue
-        if copied:
-            print(f"保留策略 {name} keep_days={row.get('keep_days')} 已写入目标")
-        else:
-            archive = f" archive_dir={row['archive_dir']}" if row.get("archive_dir") else ""
-            print(f"源保留策略 {name} keep_days={row.get('keep_days')}{archive}（未复制，需要时加 --with-retention）")
-
-
 def run(args):
     source_token = args.from_token if args.from_token is not None else os.getenv("DUCKPORT_SYNC_FROM_TOKEN", "")
     source = Duckport(args.source, token=source_token)
@@ -947,9 +914,7 @@ def run(args):
     if args.status_file:
         with open(args.status_file, "w") as handle:
             json.dump(counts, handle)
-    planned = [plan.name for plan in plans if plan.action in ("copy", "create")]
     if args.dry_run or args.preflight:
-        print_retention(source_catalog, planned, False)
         return 1 if counts["rejects"] else 0
     if not confirm(args, plans):
         print("已取消")
@@ -962,7 +927,7 @@ def run(args):
             continue
         print(f"开始 {plan.name}", flush=True)
         try:
-            rows = apply_plan(source, target, plan, args.with_retention, source_catalog)
+            rows = apply_plan(source, target, plan)
         except (flight.FlightError, pa.ArrowException, OSError, RuntimeError, ValueError) as exc:
             failures += 1
             print(f"{plan.name}  失败  {str(exc).splitlines()[0]}", file=sys.stderr)
@@ -972,7 +937,6 @@ def run(args):
     interval = kline_interval_sql(source_catalog, target_catalog, done)
     if interval:
         target.transaction(interval)
-    print_retention(source_catalog, done, args.with_retention)
     if failures or counts["rejects"]:
         return 1
     return 0
@@ -984,7 +948,6 @@ def main(argv=None):
     parser.add_argument("--from-token", default=None, help="bearer token for the source; default DUCKPORT_SYNC_FROM_TOKEN")
     parser.add_argument("--addr", default="127.0.0.1:50051", help="target duckport, usually the local server")
     parser.add_argument("--table", action="append", default=[], help="source table to create or align; repeatable")
-    parser.add_argument("--with-retention", action="store_true", help="copy retention_policy rows for synced tables")
     parser.add_argument("--allow-gap", action="store_true",
                         help="copy even when the source keeps no row at or before the target watermark")
     parser.add_argument("--dry-run", action="store_true", help="print the plan only")

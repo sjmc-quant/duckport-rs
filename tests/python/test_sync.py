@@ -427,6 +427,21 @@ def test_gap_after_target_watermark_is_rejected():
     assert failed.action == "reject" and "无法检查缺口" in failed.reason
 
 
+def test_retention_policy_is_not_copied():
+    import contextlib
+    import io
+    import sync
+    assert "retention_policy" in sync.SYSTEM_TABLES
+    assert not sync.is_business("retention_policy")
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            sync.main(["--from", "127.0.0.1:1", "--with-retention", "--dry-run"])
+        except SystemExit as exc:
+            assert exc.code == 2
+        else:
+            raise AssertionError("--with-retention should be gone")
+
+
 def main():
     test_flight_token_override()
     test_column_order_type_and_nulls()
@@ -441,6 +456,7 @@ def main():
     test_mode2_keeps_column_defaults()
     test_keyset_pages_read_every_row()
     test_gap_after_target_watermark_is_rejected()
+    test_retention_policy_is_not_copied()
     print("ok")
 
 
