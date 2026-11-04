@@ -46,6 +46,14 @@ SYSTEM_TABLES = {
 }
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 SAFE_TYPE = re.compile(r"[A-Za-z0-9_\[\],() ]+")
+# Column defaults as duckdb_columns() prints them. Only literals and clock
+# functions are copied; anything else (nextval, macros) is rejected at plan time.
+_LITERAL = r"(?:'(?:[^']|'')*'|-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)"
+SAFE_DEFAULT = re.compile(
+    rf"(?:NULL|{_LITERAL}|CAST\({_LITERAL} AS [A-Za-z0-9_\[\],() ]+\)"
+    r"|current_timestamp|current_date|current_time|now\(\)|get_current_timestamp\(\)|today\(\))",
+    re.IGNORECASE,
+)
 KLINE_TABLE = re.compile(r"^(usdt_perp|usdt_spot)_\d+[mhd]$")
 
 SPEC_FIELDS = (
@@ -318,6 +326,9 @@ def _create_plan(name, source, columns, spec):
         missing.append(spec.time_column)
     if missing:
         return _reject(name, "去重键或时间列不在表中：源缺少 " + ", ".join(missing))
+    unsafe = [f"{c.name} = {c.default}" for c in columns if c.default is not None and not is_safe_default(c.default)]
+    if unsafe:
+        return _reject(name, "列默认值无法照抄，请先在目标手工建表：" + "；".join(unsafe))
     try:
         source_duck = _watermark_value(source.watermarks.get(name), "duck_time")
     except (TypeError, ValueError) as exc:
@@ -391,10 +402,21 @@ def safe_type(data_type):
     return str(data_type).strip()
 
 
-def create_table_sql(table, columns, schema="data"):
+def is_safe_default(expr):
+    return bool(SAFE_DEFAULT.fullmatch(str(expr).strip()))
+
+
+def create_table_sql(table, columns, schema="data", defaults=True):
+    """Columns, NOT NULL and defaults. Writers that omit a defaulted column
+    (exginfo.created_time) rely on the default being there. Staging tables
+    receive every column and skip defaults."""
     parts = []
     for column in columns:
         part = f"{q(column.name)} {safe_type(column.data_type)}"
+        if defaults and column.default is not None:
+            if not is_safe_default(column.default):
+                raise ValueError(f"unexpected default for {column.name}: {column.default!r}")
+            part += f" DEFAULT {str(column.default).strip()}"
         if not column.nullable:
             part += " NOT NULL"
         parts.append(part)
@@ -674,8 +696,8 @@ def batch_time_bounds(table, time_column):
     return as_naive(lo), as_naive(hi)
 
 
-def _read_limited(source, plan, predicates, limit):
-    return source.query_arrow(select_sql(plan, predicates, limit=limit))
+def _read_limited(source, plan, predicates, limit, order=None):
+    return source.query_arrow(select_sql(plan, predicates, limit=limit, order=order))
 
 
 def _sample_page_rows(source, plan, predicates):
@@ -692,6 +714,8 @@ def _sample_page_rows(source, plan, predicates):
 
 
 def _iter_keyset(source, plan, predicates, order, page_rows):
+    """Pages ordered by ``order``. The next page starts after the last row's key,
+    so every page must be read in that same order or rows are skipped."""
     last = None
     rows = page_rows
     while True:
@@ -701,7 +725,7 @@ def _iter_keyset(source, plan, predicates, order, page_rows):
             right = ", ".join(sql_literal(value) for value in last)
             page_preds.append(f"({left}) > ({right})")
         try:
-            table = _read_limited(source, plan, page_preds, rows)
+            table = _read_limited(source, plan, page_preds, rows, order)
         except (flight.FlightError, pa.ArrowException, OSError) as exc:
             if is_page_too_big(exc) and rows > 1:
                 rows = max(1, rows // 2)
@@ -784,7 +808,7 @@ def apply_plan(source, target, plan, with_retention, source_catalog):
     page_rows = _sample_page_rows(source, plan, bounds)
     statements = [
         f"DROP TABLE IF EXISTS {staging_sql_name}",
-        create_table_sql(staging, plan.columns, schema="main"),
+        create_table_sql(staging, plan.columns, schema="main", defaults=False),
     ]
     if plan.action == "create":
         statements.insert(0, create_table_sql(plan.name, plan.columns))

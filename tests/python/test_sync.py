@@ -11,7 +11,7 @@ from duckport_flight import flight_client_kwargs
 from reconcile.specs import TableSpec
 from sync import (
     Catalog, Column, Plan, build_plans, compare_columns, create_table_sql, initial_window,
-    merge_sql, page_rows_for, shrink_window, watermark_sql,
+    is_safe_default, iter_batches, merge_sql, page_rows_for, shrink_window, watermark_sql,
 )
 
 T0 = datetime(2024, 1, 1)
@@ -305,6 +305,87 @@ def test_merge_sql_window_and_duckdb():
     assert inserted[2] == T1
 
 
+def test_mode2_keeps_column_defaults():
+    import duckdb
+    exginfo = [
+        col("market", "VARCHAR", True), col("symbol", "VARCHAR", True),
+        col("created_time", "TIMESTAMP", True, "CURRENT_TIMESTAMP"),
+    ]
+    source = catalog(["exginfo"], {"exginfo": exginfo}, {})
+    plan = build_plans(source, catalog([], {}), ["exginfo"])[0]
+    assert plan.action == "create"
+    con = duckdb.connect()
+    con.execute("CREATE SCHEMA data")
+    con.execute(create_table_sql(plan.name, plan.columns))
+    # The plugin refreshes exginfo without naming created_time.
+    con.execute("INSERT INTO data.exginfo (market, symbol) VALUES ('usdt_perp', 'A')")
+    assert con.execute("SELECT created_time IS NOT NULL FROM data.exginfo").fetchone()[0]
+    assert con.execute(
+        "SELECT column_default FROM duckdb_columns() WHERE table_name = 'exginfo' AND column_name = 'created_time'"
+    ).fetchone()[0] == "CURRENT_TIMESTAMP"
+    # Staging receives every column, so it carries no defaults.
+    assert "DEFAULT" not in create_table_sql("_sync_exginfo", plan.columns, schema="main", defaults=False)
+
+    # Defaults as duckdb_columns() prints them round-trip through the created table.
+    printed = ["0", "-1.5", "'it''s'", "NULL", "CAST('t' AS BOOLEAN)", "CAST('2020-01-01' AS TIMESTAMP)",
+               "now()", "current_date", "get_current_timestamp()"]
+    for expr in printed:
+        assert is_safe_default(expr), expr
+    for expr in ("nextval('s')", "main.list_value('x')", "(1 + 2)", "0); DROP TABLE data.x; --"):
+        assert not is_safe_default(expr), expr
+
+    seq = catalog(["ids"], {"ids": [col("id", "BIGINT", False, "nextval('s')"), col("ts", "TIMESTAMP", False)]}, {})
+    seq.specs["ids"] = spec("ids", ("id",), "ts")
+    rejected = build_plans(seq, catalog([], {}), ["ids"])[0]
+    assert rejected.action == "reject"
+    assert "nextval" in rejected.reason
+
+    # Align mode does not create tables, so an uncopyable default does not block it.
+    target = catalog(["ids"], {"ids": seq.columns["ids"]}, {}, specs={"ids": spec("ids", ("id",), "ts")})
+    seq.watermarks["ids"] = wm(T1, time_column="ts")
+    assert build_plans(seq, target, None)[0].action == "copy"
+
+
+class _DuckSource:
+    """query_arrow over an in-process DuckDB, standing in for the source Flight."""
+
+    def __init__(self, con):
+        self.con = con
+        self.sql = []
+
+    def query_arrow(self, sql):
+        self.sql.append(sql)
+        result = self.con.execute(sql).arrow()
+        return result.read_all() if hasattr(result, "read_all") else result
+
+
+def test_keyset_pages_read_every_row():
+    import duckdb
+    con = duckdb.connect()
+    con.execute("CREATE SCHEMA data")
+    # Inserted out of key order, as an unkeyed table filled by several writers would be.
+    con.execute(
+        "CREATE TABLE data.refs AS SELECT (i * 7919) % 1000 AS k, "
+        "TIMESTAMP '2024-01-01' + to_seconds((i % 7)::BIGINT) AS ts, i AS v FROM range(1000) r(i)"
+    )
+    source = _DuckSource(con)
+    columns = (col("k", "BIGINT", False), col("ts", "TIMESTAMP", False), col("v", "BIGINT", False))
+
+    single = Plan(name="refs", action="create", dedup_key=("k",), columns=columns, copy_all=True)
+    keys = [k for batch in iter_batches(source, single, 100) for k in batch.column("k").to_pylist()]
+    assert sorted(keys) == list(range(1000))
+    assert len(keys) == 1000
+    assert all("ORDER BY" in sql for sql in source.sql)
+
+    # Two-column key, as in the fallback after the time window cannot shrink further.
+    composite = Plan(name="refs", action="create", dedup_key=("ts", "k"), columns=columns, copy_all=True)
+    pairs = [
+        pair for batch in iter_batches(source, composite, 64)
+        for pair in zip(batch.column("ts").to_pylist(), batch.column("k").to_pylist())
+    ]
+    assert len(pairs) == 1000 and len(set(pairs)) == 1000
+
+
 def main():
     test_flight_token_override()
     test_column_order_type_and_nulls()
@@ -316,6 +397,8 @@ def main():
     test_primary_key_is_a_note_not_a_rejection()
     test_page_and_window_sizes()
     test_merge_sql_window_and_duckdb()
+    test_mode2_keeps_column_defaults()
+    test_keyset_pages_read_every_row()
     print("ok")
 
 
