@@ -12,7 +12,7 @@
 #   duckport restart [<实例>|all]        # 重启（默认 all）
 #   duckport logs    <实例>|server|all   # 实时日志
 #   duckport update  <实例名> [--proxy URL]  # 更新插件（自动判断本地/GitHub）
-#   duckport loadhist <实例>             # 补历史数据（必须指定实例）
+#   duckport loadhist <实例> [参数...]   # 补历史数据（参数传给插件的 loadhist）
 #   duckport upgrade [--proxy URL]       # 升级：服务端 → 插件 → 数据对齐（--plan 只看计划）
 #   duckport upgrade --data              # 只做数据对齐，含压缩（--no-compact、--finalize、--rollback）
 #   duckport upgrade --compact           # 只做压缩：重建已完成但空间还没还给磁盘时
@@ -986,7 +986,7 @@ cmd_loadhist() {
   _require_root
   local inst="${1:-}" py cfg bin gap=0 ans
   if [[ -z "$inst" ]]; then
-    echo -e "${RED}用法：duckport loadhist <实例名>${NC}"
+    echo -e "${RED}用法：duckport loadhist <实例名> [传给插件 loadhist 的参数...]${NC}"
     echo "已注册实例："
     _list_instances | sed 's/^/  /'
     exit 1
@@ -1005,6 +1005,7 @@ cmd_loadhist() {
     echo -e "${YELLOW}${inst}（$(_instance_exec "$inst")）没有 loadhist，未做任何操作，实例未停止${NC}"
     exit 1
   fi
+  shift
 
   _start_gap_check --instance "$inst" || gap=$?
   if [[ $gap -eq 1 && -t 0 ]]; then
@@ -1016,7 +1017,7 @@ cmd_loadhist() {
   echo -e "  ${YELLOW}⚠ 停止 ingestor 以独占 staging 表${NC}"
   _svc_stop "$SVC_INGESTOR@$inst"
 
-  INGESTOR_ENV_FILE="$cfg" "$bin" && \
+  INGESTOR_ENV_FILE="$cfg" "$bin" "$@" && \
     echo -e "  ${GREEN}✓ loadhist 完成${NC}" || \
     echo -e "  ${RED}✗ loadhist 失败${NC}"
 
@@ -1812,7 +1813,7 @@ ${BOLD}示例：${NC}
   duckport rm binance-5m              # 删除 binance-5m 实例
   duckport start binance-5m           # 启动单个实例
   duckport logs binance-5m            # 查看该实例日志
-  duckport loadhist binance-5m        # 补历史数据
+  duckport loadhist binance-5m        # 补历史数据；插件参数跟在实例名后面
 "
 }
 
@@ -1832,7 +1833,7 @@ case "$CMD" in
   stop)     cmd_stop    "${1:-all}" ;;
   restart)  cmd_restart "${1:-all}" ;;
   logs)     cmd_logs    "${1:-}" ;;
-  loadhist) cmd_loadhist "${1:-}" ;;
+  loadhist) cmd_loadhist "$@" ;;
   retention) cmd_retention "$@" ;;
   doctor)   cmd_doctor "$@" ;;
   upgrade)  cmd_upgrade "$@" ;;

@@ -129,5 +129,50 @@
         "empty_hint": "留空跳过"
       }
     ]
+  },
+  "binance-announcements": {
+    "repo": "https://github.com/sjmc-quant/duckport-binance-announcements",
+    "description": "Binance support announcement ingestor (catalog 48/49/161)",
+    "exec": "binance-announcements",
+    "default_instance": "binance-announcements",
+    "config": [
+      {
+        "name": "CATALOGS",
+        "label": "公告 catalog",
+        "default": "48,49,161"
+      },
+      {
+        "name": "REQUEST_DELAY_SECONDS",
+        "label": "请求间隔秒数",
+        "default": "2"
+      },
+      {
+        "name": "POLL_INTERVAL_SECONDS",
+        "label": "轮询间隔秒数",
+        "default": "600"
+      },
+      {
+        "name": "CHALLENGE_COOLDOWN_SECONDS",
+        "label": "验证墙冷却秒数",
+        "default": "21600"
+      },
+      {
+        "name": "PROXY_URL",
+        "label": "PROXY_URL",
+        "default": "",
+        "empty_hint": "留空直连"
+      },
+      {
+        "name": "JSONL_DIR",
+        "label": "历史 jsonl 目录",
+        "default": "",
+        "empty_hint": "loadhist 必填"
+      },
+      {
+        "name": "WATERMARK_MAX_LAG_SECONDS",
+        "label": "水位允许滞后秒数",
+        "default": "604800"
+      }
+    ]
   }
 }
