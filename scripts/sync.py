@@ -17,10 +17,12 @@ An existing table is rejected when the source keeps no row at or before the
 target watermark (retention, or a later start): moving the watermark would
 hide the span in between. Fill that span on the target first.
 
-Rows are written in time order, one transaction per batch, and each batch
-moves the target watermark to its last timestamp in that same transaction.
-A batch never splits one timestamp, so an interrupted run leaves a watermark
-that every row before it has reached.
+Rows are written in time order, one transaction per batch. The watermark
+moves in that same transaction once 1000 rows have been written since the
+previous move, to the batch's last timestamp. One timestamp is never split,
+so a move can cover more than 1000 rows. An interrupted run keeps the last
+move; rows written after it are copied again and skipped by the anti-join.
+The run always finishes by setting the watermark to the source duck_time.
 
 Only rows, the watermark, the table spec and the write mode are copied. The
 source's retention policy is not: the target keeps its own.
@@ -50,6 +52,9 @@ from reconcile.specs import builtin_spec, registered_spec
 
 PUBLIC_BYTES = 12 * 1024 * 1024
 LAN_ROWS = 200_000
+# One threshold for every table. The page cap still splits a write, and a
+# timestamp is never split, so one move may cover more rows than this.
+WATERMARK_EVERY_ROWS = 1000
 MAX_WINDOW = timedelta(days=7)
 MIN_WINDOW = timedelta(seconds=1)
 
@@ -891,6 +896,7 @@ def apply_plan(source, target, plan):
         statements.insert(0, create_table_sql(plan.name, plan.columns))
     target.transaction(statements)
     read_rows = 0
+    since_watermark = 0
     try:
         for batch, through in iter_batches(source, plan, page_rows):
             if batch.num_rows == 0:
@@ -899,8 +905,14 @@ def apply_plan(source, target, plan):
             lo, hi = batch_time_bounds(batch, plan.time_column)
             target.execute(f"TRUNCATE {staging_sql_name}")
             target.append("main", staging, batch)
-            # Rows and the watermark they reach commit together.
-            moved = watermark_sql(plan, through) if through is not None else []
+            since_watermark += batch.num_rows
+            # Keyset pages have no timestamp to vouch for, so they only count
+            # toward the next move. The rows and that move commit together.
+            moved = []
+            if through is not None and since_watermark >= WATERMARK_EVERY_ROWS:
+                moved = watermark_sql(plan, through)
+                if moved:
+                    since_watermark = 0
             target.transaction([
                 merge_sql(plan, staging_sql_name, lo, hi),
                 *moved,

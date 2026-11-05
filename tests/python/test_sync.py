@@ -607,7 +607,9 @@ def test_interrupted_sync_keeps_the_watermark_it_reached():
         )[0]
 
     sample = sync._sample_page_rows
+    every = sync.WATERMARK_EVERY_ROWS
     sync._sample_page_rows = lambda *args: 10
+    sync.WATERMARK_EVERY_ROWS = 20
     try:
         with contextlib.redirect_stdout(io.StringIO()):
             try:
@@ -617,9 +619,11 @@ def test_interrupted_sync_keeps_the_watermark_it_reached():
             else:
                 raise AssertionError("the fourth merge should have failed")
             duck, ingestor = con.execute("SELECT duck_time, ingestor FROM data.watermark").fetchone()
-            # Three batches of two minutes each committed with their watermark.
-            assert duck == datetime(2024, 1, 1, 1, 5) and ingestor == "bn1m"
-            assert con.execute("SELECT max(open_time), count(*) FROM data.usdt_perp_1m").fetchone() == (duck, 66 * 5)
+            # Two batches reach 20 rows and commit the watermark at 01:03.
+            # The third batch is stored ahead of that watermark.
+            assert duck == datetime(2024, 1, 1, 1, 3) and ingestor == "bn1m"
+            assert con.execute("SELECT max(open_time), count(*) FROM data.usdt_perp_1m").fetchone() == (
+                datetime(2024, 1, 1, 1, 5), 66 * 5)
             assert con.execute(
                 "SELECT count(*) FROM duckdb_tables() WHERE table_name LIKE '_sync_%'"
             ).fetchone()[0] == 0
@@ -628,10 +632,102 @@ def test_interrupted_sync_keeps_the_watermark_it_reached():
             apply_plan(source, _DuckTarget(con), plan_now())
     finally:
         sync._sample_page_rows = sample
+        sync.WATERMARK_EVERY_ROWS = every
     assert con.execute("SELECT duck_time FROM data.watermark").fetchone()[0] == upper
     assert con.execute("SELECT count(*), count(DISTINCT (open_time, symbol)) FROM data.usdt_perp_1m").fetchone() == (
         180 * 5, 180 * 5)
     assert _backwards(con, "data.usdt_perp_1m", "open_time") == 0
+
+
+def _watermark_moves(con):
+    """Row counts of merge transactions that also moved the watermark."""
+    moves = []
+    seen = 0
+
+    class Watch(_DuckTarget):
+        def transaction(self, statements):
+            nonlocal seen
+            if any("ANTI JOIN" in sql for sql in statements):
+                staged = con.execute('SELECT count(*) FROM main."_sync_usdt_perp_1m"').fetchone()[0]
+                seen += staged
+                if any("duck_time" in sql for sql in statements):
+                    moves.append(seen)
+            super().transaction(statements)
+            if moves and moves[-1] == seen and any("duck_time" in sql for sql in statements):
+                duck = con.execute("SELECT duck_time FROM data.watermark").fetchone()[0]
+                latest = con.execute("SELECT max(open_time) FROM data.usdt_perp_1m").fetchone()[0]
+                assert duck == latest
+
+    return Watch, moves
+
+
+def test_watermark_waits_for_1000_rows():
+    import contextlib
+    import io
+    import sync
+    assert sync.WATERMARK_EVERY_ROWS == 1000
+    source_con = _kline_source(250)
+    upper = source_con.execute("SELECT max(open_time) FROM data.usdt_perp_1m").fetchone()[0]
+    source = _DuckSource(source_con)
+    plan = Plan(
+        name="usdt_perp_1m", action="copy", upper=upper,
+        dedup_key=("open_time", "symbol"), time_column="open_time", columns=tuple(kline_cols()),
+        source_watermark=wm(upper), target_watermark=wm(datetime(2023, 12, 31), ingestor="bn1m"),
+    )
+
+    import duckdb
+    con = duckdb.connect()
+    con.execute("CREATE SCHEMA data")
+    con.execute("CREATE TABLE data.usdt_perp_1m (open_time TIMESTAMP NOT NULL, symbol VARCHAR NOT NULL, close DOUBLE)")
+    con.execute(
+        "CREATE TABLE data.watermark (table_name VARCHAR PRIMARY KEY, ingestor VARCHAR, max_lag_seconds INTEGER, "
+        "time_column VARCHAR NOT NULL, start_time TIMESTAMP, duck_time TIMESTAMP, updated_at TIMESTAMP)"
+    )
+    con.execute(
+        "INSERT INTO data.watermark VALUES ('usdt_perp_1m', 'bn1m', 900, 'open_time', NULL, "
+        "TIMESTAMP '2023-12-31', NULL)"
+    )
+    Watch, moves = _watermark_moves(con)
+    sample = sync._sample_page_rows
+    sync._sample_page_rows = lambda *args: 100
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            apply_plan(source, Watch(con), plan)
+    finally:
+        sync._sample_page_rows = sample
+    assert moves == [1000]
+    assert con.execute("SELECT duck_time, ingestor FROM data.watermark").fetchone() == (upper, "bn1m")
+    assert con.execute("SELECT count(*) FROM data.usdt_perp_1m").fetchone()[0] == 250 * 5
+    assert _backwards(con, "data.usdt_perp_1m", "open_time") == 0
+
+    # A table shorter than the threshold still gets its final watermark.
+    short_con = _kline_source(10)
+    short_upper = short_con.execute("SELECT max(open_time) FROM data.usdt_perp_1m").fetchone()[0]
+    short = duckdb.connect()
+    short.execute("CREATE SCHEMA data")
+    short.execute("CREATE TABLE data.usdt_perp_1m (open_time TIMESTAMP NOT NULL, symbol VARCHAR NOT NULL, close DOUBLE)")
+    short.execute(
+        "CREATE TABLE data.watermark (table_name VARCHAR PRIMARY KEY, ingestor VARCHAR, max_lag_seconds INTEGER, "
+        "time_column VARCHAR NOT NULL, start_time TIMESTAMP, duck_time TIMESTAMP, updated_at TIMESTAMP)"
+    )
+    short.execute(
+        "INSERT INTO data.watermark VALUES ('usdt_perp_1m', 'bn1m', 900, 'open_time', NULL, "
+        "TIMESTAMP '2023-12-31', NULL)"
+    )
+    short_plan = Plan(
+        name="usdt_perp_1m", action="copy", upper=short_upper,
+        dedup_key=("open_time", "symbol"), time_column="open_time", columns=tuple(kline_cols()),
+        source_watermark=wm(short_upper), target_watermark=wm(datetime(2023, 12, 31), ingestor="bn1m"),
+    )
+    Watch, short_moves = _watermark_moves(short)
+    sync._sample_page_rows = lambda *args: 10
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            apply_plan(_DuckSource(short_con), Watch(short), short_plan)
+    finally:
+        sync._sample_page_rows = sample
+    assert short_moves == []
+    assert short.execute("SELECT duck_time FROM data.watermark").fetchone()[0] == short_upper
 
 
 def main():
@@ -653,6 +749,7 @@ def main():
     test_merge_writes_in_time_order()
     test_batches_follow_time_and_carry_watermark()
     test_interrupted_sync_keeps_the_watermark_it_reached()
+    test_watermark_waits_for_1000_rows()
     print("ok")
 
 
