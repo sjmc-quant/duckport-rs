@@ -573,7 +573,7 @@ _start_gap_check() {
 # ─── 停写窗口 ─────────────────────────────────────────────────────────────────
 
 # 停掉正在运行的 ingestor（服务端不停），记下实例名；_start_stopped_ingestors 按原状态拉起。
-# 调用方用 trap 保证中途退出时也会拉起。
+# 不带参数停所有实例，带参数只停这些。调用方用 trap 保证中途退出时也会拉起。
 STOPPED_INGESTORS=()
 _stop_running_ingestors() {
   local inst
@@ -585,7 +585,7 @@ _stop_running_ingestors() {
       _svc_stop "$SVC_INGESTOR@$inst"
       echo -e "  ${DIM}stopped${NC} $inst"
     fi
-  done <<< "$(_list_instances)"
+  done <<< "$(if [[ $# -gt 0 ]]; then printf '%s\n' "$@"; else _list_instances; fi)"
 }
 
 _start_stopped_ingestors() {
@@ -1773,8 +1773,8 @@ _compact_restore() {
 # 从另一台 duckport 拉取。先只读预检；有表要写时才停本机 ingestor。
 cmd_sync() {
   local dry=0 yes=0 has_from=0 port rc=0 actions=0
-  local py status
-  local -a pass=()
+  local py status inst
+  local -a pass=() writers=()
   if [[ $# -eq 0 ]]; then
     echo -e "${RED}用法：duckport sync --from HOST:PORT [--from-token TOKEN] [--table 表名 ...] [--dry-run] [--yes]${NC}"
     exit 2
@@ -1837,6 +1837,22 @@ cmd_sync() {
     return $rc
   fi
   actions=$("$py" -c 'import json,sys; print(json.load(open(sys.argv[1]))["actions"])' "$status")
+  # 只停写这些表的本机实例：目标水位记下的实例名，或插件与表的写入者相同
+  while IFS= read -r inst; do
+    [[ -n "$inst" ]] && writers+=("$inst")
+  done < <(
+    while IFS= read -r inst; do
+      [[ -n "$inst" ]] && printf '%s\t%s\n' "$inst" "$(_instance_exec "$inst")"
+    done <<< "$(_list_instances)" | "$py" -c '
+import json, sys
+status = json.load(open(sys.argv[1]))
+names, plugins = set(status.get("ingestors", [])), set(status.get("writers", []))
+for line in sys.stdin:
+    inst, _, plugin = line.rstrip("\n").partition("\t")
+    if inst in names or plugin in plugins:
+        print(inst)
+' "$status"
+  )
   rm -f "$status"
   if [[ "$actions" == "0" ]]; then
     return $rc
@@ -1846,7 +1862,11 @@ cmd_sync() {
   if [[ $yes -eq 0 ]]; then
     if [[ -t 0 ]]; then
       local ans
-      read -r -p "将停止本机 ingestor 并同步 ${actions} 张表，继续？[y/N] " ans
+      if [[ ${#writers[@]} -gt 0 ]]; then
+        read -r -p "将停止 ingestor（${writers[*]}）并同步 ${actions} 张表，继续？[y/N] " ans
+      else
+        read -r -p "将同步 ${actions} 张表，继续？[y/N] " ans
+      fi
       [[ "$ans" =~ ^[Yy]$ ]] || { echo "已取消，ingestor 未停止"; return 0; }
     else
       echo -e "${RED}非交互终端请加 --yes${NC}"
@@ -1855,8 +1875,10 @@ cmd_sync() {
   fi
 
   trap _start_stopped_ingestors EXIT
-  echo -e "  ${YELLOW}⚠ 停止 ingestor，避免和同步同时写这些表${NC}"
-  _stop_running_ingestors
+  if [[ ${#writers[@]} -gt 0 ]]; then
+    echo -e "  ${YELLOW}⚠ 停止写这些表的 ingestor，避免和同步同时写${NC}"
+    _stop_running_ingestors "${writers[@]}"
+  fi
   set +e
   "$py" "$REPO_DIR/scripts/sync.py" "${pass[@]}" --yes
   rc=$?

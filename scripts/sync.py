@@ -634,6 +634,29 @@ def print_plans(plans):
             print(f"  {note}")
 
 
+def local_writers(plans, source, target):
+    """(instances, plugins) that write the tables about to change on the target.
+
+    Instances come from the target watermark; plugins from the target's table
+    spec, else the source's, else the builtin spec. The CLI stops only local
+    ingestors that match one of them.
+    """
+    instances, plugins = set(), set()
+    for plan in plans:
+        if plan.action not in ("copy", "create"):
+            continue
+        ingestor = (target.watermarks.get(plan.name) or {}).get("ingestor")
+        if ingestor:
+            instances.add(str(ingestor))
+        writer = (target.spec_rows.get(plan.name) or source.spec_rows.get(plan.name) or {}).get("writer")
+        if not writer:
+            builtin = builtin_spec(plan.name)
+            writer = builtin.plugin if builtin else None
+        if writer:
+            plugins.add(str(writer))
+    return sorted(instances), sorted(plugins)
+
+
 def summarize(plans):
     return {
         "actions": sum(plan.action in ("copy", "create") for plan in plans),
@@ -907,8 +930,9 @@ def run(args):
         f"将处理 {counts['actions']} 张表，跳过 {counts['skips']} 张，拒绝 {counts['rejects']} 张"
     )
     if args.status_file:
+        instances, plugins = local_writers(plans, source_catalog, target_catalog)
         with open(args.status_file, "w") as handle:
-            json.dump(counts, handle)
+            json.dump({**counts, "ingestors": instances, "writers": plugins}, handle)
     if args.dry_run or args.preflight:
         return 1 if counts["rejects"] else 0
     if not confirm(args, plans):

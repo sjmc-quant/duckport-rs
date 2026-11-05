@@ -11,7 +11,7 @@ from duckport_flight import flight_client_kwargs
 from reconcile.specs import TableSpec
 from sync import (
     Catalog, Column, Plan, build_plans, check_gaps, compare_columns, create_table_sql, initial_window,
-    is_safe_default, iter_batches, merge_sql, page_rows_for, shrink_window, watermark_sql,
+    is_safe_default, iter_batches, local_writers, merge_sql, page_rows_for, shrink_window, watermark_sql,
 )
 
 T0 = datetime(2024, 1, 1)
@@ -439,6 +439,36 @@ def test_retention_policy_is_not_copied():
             raise AssertionError("--with-retention should be gone")
 
 
+def test_only_writers_of_synced_tables_are_stopped():
+    kline = {"usdt_perp_1m": kline_cols(), "usdt_spot_1m": kline_cols()}
+    anc = [col("catalog_id", "INTEGER", False), col("code", "VARCHAR", False), col("release_time", "TIMESTAMP", False)]
+    source = catalog(
+        ["usdt_perp_1m", "usdt_spot_1m", "binance_announcements"],
+        {**kline, "binance_announcements": anc},
+        {"usdt_perp_1m": wm(T1), "usdt_spot_1m": wm(T0), "binance_announcements": wm(T1, time_column="release_time")},
+        specs={"binance_announcements": spec("binance_announcements", ("catalog_id", "code"), "release_time")},
+    )
+    source.spec_rows["binance_announcements"] = {"table_name": "binance_announcements", "writer": "binance-announcements"}
+    target = catalog(
+        ["usdt_perp_1m", "usdt_spot_1m"], kline,
+        {"usdt_perp_1m": wm(T0, ingestor="bn1m"), "usdt_spot_1m": wm(T1, ingestor="bn1m-spot")},
+    )
+
+    # Creating the announcements table touches no kline writer.
+    created = build_plans(source, target, ["binance_announcements"])
+    assert [p.action for p in created] == ["create"]
+    assert local_writers(created, source, target) == ([], ["binance-announcements"])
+
+    # Aligning: perp_1m is copied (its instance and plugin); spot_1m is already ahead and skipped.
+    aligned = build_plans(source, target, None)
+    assert {p.name: p.action for p in aligned} == {"usdt_perp_1m": "copy", "usdt_spot_1m": "skip"}
+    assert local_writers(aligned, source, target) == (["bn1m"], ["binance-ingestor"])
+
+    # The target's own spec names the writer before the source's.
+    target.spec_rows["usdt_perp_1m"] = {"table_name": "usdt_perp_1m", "writer": "my-kline-writer"}
+    assert local_writers(aligned, source, target) == (["bn1m"], ["my-kline-writer"])
+
+
 def main():
     test_flight_token_override()
     test_column_order_type_and_nulls()
@@ -454,6 +484,7 @@ def main():
     test_keyset_pages_read_every_row()
     test_gap_after_target_watermark_is_rejected()
     test_retention_policy_is_not_copied()
+    test_only_writers_of_synced_tables_are_stopped()
     print("ok")
 
 
