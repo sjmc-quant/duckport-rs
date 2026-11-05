@@ -58,7 +58,7 @@
     ]
   },
   "aster-ingestor": {
-    "repo": "https://github.com/fdguuwzj/duckport-aster-ingestor.git",
+    "repo": "https://github.com/sjmc-quant/duckport-aster-ingestor",
     "description": "Aster USDT-Perp K-line ingestor",
     "exec": "aster-ingestor",
     "default_instance": "aster-1h",
@@ -92,7 +92,7 @@
     ]
   },
   "binance-open-interest": {
-    "repo": "https://github.com/fdguuwzj/duckport-binance-open-interest.git",
+    "repo": "https://github.com/sjmc-quant/duckport-binance-open-interest",
     "description": "Binance USD-M open-interest ingestor (5m K-line labels, or 1m snapshot)",
     "exec": "binance-open-interest",
     "default_instance": "binance-open-interest-5m",
@@ -167,6 +167,49 @@
         "name": "WATERMARK_MAX_LAG_SECONDS",
         "label": "水位允许滞后秒数",
         "default": "604800"
+      }
+    ]
+  },
+  "binance-predicted-funding": {
+    "repo": "https://github.com/sjmc-quant/duckport-binance-predicted-funding",
+    "description": "Binance USD-M 1-minute predicted funding-rate ingestor",
+    "exec": "binance-predicted-funding",
+    "default_instance": "binance-predicted-funding-1m",
+    "config": [
+      {
+        "name": "POLL_DELAY_SECONDS",
+        "label": "分钟后延迟秒数",
+        "default": "2"
+      },
+      {
+        "name": "PROXY_URL",
+        "label": "PROXY_URL",
+        "default": "",
+        "empty_hint": "留空跳过"
+      }
+    ]
+  },
+  "binance-mcap": {
+    "repo": "https://github.com/sjmc-quant/duckport-binance-mcap",
+    "description": "Binance USDT-Perp hourly circulating market-cap ingestor",
+    "exec": "binance-mcap",
+    "default_instance": "binance-mcap-1h",
+    "config": [
+      {
+        "name": "UPDATE_MINUTE",
+        "label": "每小时第几分钟采集",
+        "default": "5"
+      },
+      {
+        "name": "CONCURRENCY",
+        "label": "并发数",
+        "default": "8"
+      },
+      {
+        "name": "PROXY_URL",
+        "label": "PROXY_URL",
+        "default": "",
+        "empty_hint": "留空跳过"
       }
     ]
   }
