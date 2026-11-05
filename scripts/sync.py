@@ -17,6 +17,11 @@ An existing table is rejected when the source keeps no row at or before the
 target watermark (retention, or a later start): moving the watermark would
 hide the span in between. Fill that span on the target first.
 
+Rows are written in time order, one transaction per batch. The watermark
+moves forward with those rows and finishes at the source duck_time. A batch
+never splits one timestamp. An interrupted run keeps the last committed
+watermark; rows written after it are copied again and skipped by the anti-join.
+
 Only rows, the watermark, the table spec and the write mode are copied. The
 source's retention policy is not: the target keeps its own.
 
@@ -45,6 +50,11 @@ from reconcile.specs import builtin_spec, registered_spec
 
 PUBLIC_BYTES = 12 * 1024 * 1024
 LAN_ROWS = 200_000
+# How often sync moves a watermark. Internal to apply_plan: not a command-line
+# flag, environment variable, or config entry. Ingestors keep advancing their
+# own watermarks on each write. The page cap still splits a write, and a
+# timestamp is never split, so one move may cover more rows than this.
+_WATERMARK_EVERY_ROWS = 1000
 MAX_WINDOW = timedelta(days=7)
 MIN_WINDOW = timedelta(seconds=1)
 
@@ -473,6 +483,13 @@ def select_sql(plan, predicates, limit=None, order=None):
     return sql
 
 
+def write_order(plan):
+    """Time column first, then the rest of the dedup key. Without a time column, the dedup key."""
+    if not plan.time_column:
+        return list(plan.dedup_key)
+    return [plan.time_column] + [name for name in plan.dedup_key if name != plan.time_column]
+
+
 def merge_sql(plan, staging, batch_lo=None, batch_hi=None):
     """Insert staged rows whose dedup key is not already in the target.
 
@@ -500,9 +517,10 @@ def merge_sql(plan, staging, batch_lo=None, batch_hi=None):
     else:
         anti = f"(SELECT {key_list} FROM data.{q(plan.name)}) t"
     selected = ", ".join(f"s.{column}" for column in columns)
+    order = ", ".join(f"s.{q(name)}" for name in write_order(plan))
     return (
         f"INSERT INTO data.{q(plan.name)} ({column_list}) "
-        f"SELECT {selected} FROM ({distinct}) s ANTI JOIN {anti} ON {join_on}"
+        f"SELECT {selected} FROM ({distinct}) s ANTI JOIN {anti} ON {join_on} ORDER BY {order}"
     )
 
 
@@ -530,10 +548,13 @@ def spec_upsert_sql(row):
     )
 
 
-def watermark_sql(plan):
-    """Statements that move the target watermark. Empty when there is nothing to set."""
+def watermark_sql(plan, duck=None):
+    """Statements that move the target watermark to ``duck`` (default: the source
+    watermark). Empty when the plan writes no watermark."""
     source = plan.source_watermark or {}
-    duck = None if plan.copy_all else plan.upper
+    if plan.copy_all:
+        return []
+    duck = plan.upper if duck is None else duck
     if duck is None:
         return []
     if plan.action == "copy" and plan.target_watermark is not None:
@@ -632,6 +653,29 @@ def print_plans(plans):
             print(f"  {diff}")
         for note in plan.notes:
             print(f"  {note}")
+
+
+def local_writers(plans, source, target):
+    """(instances, plugins) that write the tables about to change on the target.
+
+    Instances come from the target watermark; plugins from the target's table
+    spec, else the source's, else the builtin spec. The CLI stops only local
+    ingestors that match one of them.
+    """
+    instances, plugins = set(), set()
+    for plan in plans:
+        if plan.action not in ("copy", "create"):
+            continue
+        ingestor = (target.watermarks.get(plan.name) or {}).get("ingestor")
+        if ingestor:
+            instances.add(str(ingestor))
+        writer = (target.spec_rows.get(plan.name) or source.spec_rows.get(plan.name) or {}).get("writer")
+        if not writer:
+            builtin = builtin_spec(plan.name)
+            writer = builtin.plugin if builtin else None
+        if writer:
+            plugins.add(str(writer))
+    return sorted(instances), sorted(plugins)
 
 
 def summarize(plans):
@@ -769,10 +813,28 @@ def _period_of(name):
     return spec.period if spec else None
 
 
+def time_slices(table, time_column, page_rows):
+    """Cut a time-sorted table into slices of about ``page_rows``. A cut never
+    falls inside one timestamp, so every row up to a slice's last time is in
+    that slice or an earlier one."""
+    column = table.column(time_column)
+    start, total = 0, table.num_rows
+    while start < total:
+        end = min(start + page_rows, total)
+        if end < total:
+            end = pc.sum(pc.less_equal(column, column[end - 1])).as_py()
+        yield table.slice(start, end - start)
+        start = end
+
+
 def iter_batches(source, plan, page_rows):
-    """Yield Arrow batches for one plan. Time columns are read in windows."""
+    """Yield (batch, through) in write order. ``through`` is the time every
+    source row up to which is in this batch or an earlier one, or None when a
+    batch cannot vouch for that (no time column, or keyset pages)."""
+    order = write_order(plan)
     if not plan.time_column:
-        yield from _iter_keyset(source, plan, [], list(plan.dedup_key), page_rows)
+        for batch in _iter_keyset(source, plan, [], order, page_rows):
+            yield batch, None
         return
 
     bounds = time_predicates(plan.time_column, plan.lower, None if plan.copy_all else plan.upper)
@@ -798,10 +860,8 @@ def iter_batches(source, plan, page_rows):
                 window = max(MIN_WINDOW, window / 2)
                 continue
             if is_page_too_big(exc):
-                order = list(plan.dedup_key)
-                if plan.time_column not in order:
-                    order.append(plan.time_column)
-                yield from _iter_keyset(source, plan, predicates, order, page_rows)
+                for batch in _iter_keyset(source, plan, predicates, order, page_rows):
+                    yield batch, None
                 cursor = nxt
                 continue
             raise
@@ -811,8 +871,9 @@ def iter_batches(source, plan, page_rows):
             window = shrink_window(window, table.num_rows, page_rows)
             continue
         if table.num_rows:
-            for offset in range(0, table.num_rows, page_rows):
-                yield table.slice(offset, min(page_rows, table.num_rows - offset))
+            table = table.sort_by([(name, "ascending") for name in order])
+            for batch in time_slices(table, plan.time_column, page_rows):
+                yield batch, as_naive(batch.column(plan.time_column)[batch.num_rows - 1].as_py())
         if table.num_rows < max(1, page_rows // 4):
             window = min(window * 2, MAX_WINDOW)
         cursor += used
@@ -835,20 +896,31 @@ def apply_plan(source, target, plan):
         statements.insert(0, create_table_sql(plan.name, plan.columns))
     target.transaction(statements)
     read_rows = 0
+    since_watermark = 0
     try:
-        for batch in iter_batches(source, plan, page_rows):
+        for batch, through in iter_batches(source, plan, page_rows):
             if batch.num_rows == 0:
                 continue
             batch = normalize_batch(batch, plan.columns)
             lo, hi = batch_time_bounds(batch, plan.time_column)
             target.execute(f"TRUNCATE {staging_sql_name}")
             target.append("main", staging, batch)
+            since_watermark += batch.num_rows
+            # Keyset pages have no timestamp to vouch for, so they only count
+            # toward the next move. The rows and that move commit together.
+            moved = []
+            if through is not None and since_watermark >= _WATERMARK_EVERY_ROWS:
+                moved = watermark_sql(plan, through)
+                if moved:
+                    since_watermark = 0
             target.transaction([
                 merge_sql(plan, staging_sql_name, lo, hi),
+                *moved,
                 f"TRUNCATE {staging_sql_name}",
             ])
             read_rows += batch.num_rows
-            print(f"  {plan.name}  已读取 {read_rows:,} 行", flush=True)
+            reached = f"  水位 {fmt(through)}" if moved else ""
+            print(f"  {plan.name}  已读取 {read_rows:,} 行{reached}", flush=True)
         meta = []
         if plan.write_spec and plan.spec_row:
             meta.append(spec_upsert_sql(plan.spec_row))
@@ -907,8 +979,9 @@ def run(args):
         f"将处理 {counts['actions']} 张表，跳过 {counts['skips']} 张，拒绝 {counts['rejects']} 张"
     )
     if args.status_file:
+        instances, plugins = local_writers(plans, source_catalog, target_catalog)
         with open(args.status_file, "w") as handle:
-            json.dump(counts, handle)
+            json.dump({**counts, "ingestors": instances, "writers": plugins}, handle)
     if args.dry_run or args.preflight:
         return 1 if counts["rejects"] else 0
     if not confirm(args, plans):
