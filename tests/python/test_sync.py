@@ -607,9 +607,9 @@ def test_interrupted_sync_keeps_the_watermark_it_reached():
         )[0]
 
     sample = sync._sample_page_rows
-    every = sync.WATERMARK_EVERY_ROWS
+    every = sync._WATERMARK_EVERY_ROWS
     sync._sample_page_rows = lambda *args: 10
-    sync.WATERMARK_EVERY_ROWS = 20
+    sync._WATERMARK_EVERY_ROWS = 20
     try:
         with contextlib.redirect_stdout(io.StringIO()):
             try:
@@ -632,7 +632,7 @@ def test_interrupted_sync_keeps_the_watermark_it_reached():
             apply_plan(source, _DuckTarget(con), plan_now())
     finally:
         sync._sample_page_rows = sample
-        sync.WATERMARK_EVERY_ROWS = every
+        sync._WATERMARK_EVERY_ROWS = every
     assert con.execute("SELECT duck_time FROM data.watermark").fetchone()[0] == upper
     assert con.execute("SELECT count(*), count(DISTINCT (open_time, symbol)) FROM data.usdt_perp_1m").fetchone() == (
         180 * 5, 180 * 5)
@@ -665,7 +665,7 @@ def test_watermark_waits_for_1000_rows():
     import contextlib
     import io
     import sync
-    assert sync.WATERMARK_EVERY_ROWS == 1000
+    assert sync._WATERMARK_EVERY_ROWS == 1000
     source_con = _kline_source(250)
     upper = source_con.execute("SELECT max(open_time) FROM data.usdt_perp_1m").fetchone()[0]
     source = _DuckSource(source_con)

@@ -18,11 +18,9 @@ target watermark (retention, or a later start): moving the watermark would
 hide the span in between. Fill that span on the target first.
 
 Rows are written in time order, one transaction per batch. The watermark
-moves in that same transaction once 1000 rows have been written since the
-previous move, to the batch's last timestamp. One timestamp is never split,
-so a move can cover more than 1000 rows. An interrupted run keeps the last
-move; rows written after it are copied again and skipped by the anti-join.
-The run always finishes by setting the watermark to the source duck_time.
+moves forward with those rows and finishes at the source duck_time. A batch
+never splits one timestamp. An interrupted run keeps the last committed
+watermark; rows written after it are copied again and skipped by the anti-join.
 
 Only rows, the watermark, the table spec and the write mode are copied. The
 source's retention policy is not: the target keeps its own.
@@ -52,9 +50,11 @@ from reconcile.specs import builtin_spec, registered_spec
 
 PUBLIC_BYTES = 12 * 1024 * 1024
 LAN_ROWS = 200_000
-# One threshold for every table. The page cap still splits a write, and a
+# How often sync moves a watermark. Internal to apply_plan: not a command-line
+# flag, environment variable, or config entry. Ingestors keep advancing their
+# own watermarks on each write. The page cap still splits a write, and a
 # timestamp is never split, so one move may cover more rows than this.
-WATERMARK_EVERY_ROWS = 1000
+_WATERMARK_EVERY_ROWS = 1000
 MAX_WINDOW = timedelta(days=7)
 MIN_WINDOW = timedelta(seconds=1)
 
@@ -909,7 +909,7 @@ def apply_plan(source, target, plan):
             # Keyset pages have no timestamp to vouch for, so they only count
             # toward the next move. The rows and that move commit together.
             moved = []
-            if through is not None and since_watermark >= WATERMARK_EVERY_ROWS:
+            if through is not None and since_watermark >= _WATERMARK_EVERY_ROWS:
                 moved = watermark_sql(plan, through)
                 if moved:
                     since_watermark = 0
