@@ -11,7 +11,7 @@ from duckport_flight import flight_client_kwargs
 from reconcile.specs import TableSpec
 from sync import (
     Catalog, Column, Plan, build_plans, check_gaps, compare_columns, create_table_sql, initial_window,
-    is_safe_default, iter_batches, local_writers, merge_sql, page_rows_for, shrink_window, watermark_sql,
+    apply_plan, is_safe_default, iter_batches, local_writers, merge_sql, page_rows_for, shrink_window, watermark_sql,
 )
 
 T0 = datetime(2024, 1, 1)
@@ -375,7 +375,7 @@ def test_keyset_pages_read_every_row():
     columns = (col("k", "BIGINT", False), col("ts", "TIMESTAMP", False), col("v", "BIGINT", False))
 
     single = Plan(name="refs", action="create", dedup_key=("k",), columns=columns, copy_all=True)
-    keys = [k for batch in iter_batches(source, single, 100) for k in batch.column("k").to_pylist()]
+    keys = [k for batch, _ in iter_batches(source, single, 100) for k in batch.column("k").to_pylist()]
     assert sorted(keys) == list(range(1000))
     assert len(keys) == 1000
     assert all("ORDER BY" in sql for sql in source.sql)
@@ -383,7 +383,7 @@ def test_keyset_pages_read_every_row():
     # Two-column key, as in the fallback after the time window cannot shrink further.
     composite = Plan(name="refs", action="create", dedup_key=("ts", "k"), columns=columns, copy_all=True)
     pairs = [
-        pair for batch in iter_batches(source, composite, 64)
+        pair for batch, _ in iter_batches(source, composite, 64)
         for pair in zip(batch.column("ts").to_pylist(), batch.column("k").to_pylist())
     ]
     assert len(pairs) == 1000 and len(set(pairs)) == 1000
@@ -469,6 +469,171 @@ def test_only_writers_of_synced_tables_are_stopped():
     assert local_writers(aligned, source, target) == (["bn1m"], ["my-kline-writer"])
 
 
+def _backwards(con, table, time_column):
+    return con.execute(
+        f"SELECT count(*) FILTER (WHERE t < prev) FROM "
+        f"(SELECT {time_column} AS t, lag({time_column}) OVER (ORDER BY rowid) AS prev FROM {table})"
+    ).fetchone()[0]
+
+
+def test_merge_writes_in_time_order():
+    import duckdb
+    con = duckdb.connect()
+    con.execute("SET threads = 8")
+    con.execute("CREATE SCHEMA data")
+    kline = Plan(name="usdt_perp_1m", action="copy", dedup_key=("open_time", "symbol"),
+                 time_column="open_time", columns=tuple(kline_cols()))
+    con.execute("CREATE TABLE data.usdt_perp_1m (open_time TIMESTAMP NOT NULL, symbol VARCHAR NOT NULL, close DOUBLE)")
+    con.execute("CREATE TABLE stage_k AS SELECT * FROM data.usdt_perp_1m LIMIT 0")
+    con.execute(
+        "INSERT INTO stage_k SELECT TIMESTAMP '2024-01-01' + to_minutes(m::BIGINT), 'S' || s, m "
+        "FROM range(400) a(m), range(500) b(s) ORDER BY random()"
+    )
+    sql = merge_sql(kline, "stage_k")
+    assert sql.endswith('ORDER BY s."open_time", s."symbol"')
+    con.execute(sql)
+    assert con.execute("SELECT count(*) FROM data.usdt_perp_1m").fetchone()[0] == 200_000
+    assert _backwards(con, "data.usdt_perp_1m", "open_time") == 0
+
+    # Dedup key without the time column: still written by time.
+    anc = Plan(name="anc", action="copy", dedup_key=("catalog_id", "code"), time_column="release_time",
+               columns=(col("catalog_id", "INTEGER", False), col("code"), col("release_time", "TIMESTAMP", False)))
+    con.execute("CREATE TABLE data.anc (catalog_id INTEGER NOT NULL, code VARCHAR, release_time TIMESTAMP NOT NULL)")
+    con.execute(
+        "CREATE TABLE stage_a AS SELECT (i % 3)::INTEGER AS catalog_id, md5(i::VARCHAR) AS code, "
+        "TIMESTAMP '2017-01-01' + to_minutes((i * 37)::BIGINT) AS release_time FROM range(50000) r(i) ORDER BY random()"
+    )
+    con.execute(merge_sql(anc, "stage_a"))
+    assert _backwards(con, "data.anc", "release_time") == 0
+
+
+def _kline_source(minutes, symbols=5):
+    import duckdb
+    con = duckdb.connect()
+    con.execute("CREATE SCHEMA data")
+    con.execute(
+        "CREATE TABLE data.usdt_perp_1m AS SELECT TIMESTAMP '2024-01-01' + to_minutes(m::BIGINT) AS open_time, "
+        f"'S' || s AS symbol, (m * 10 + s)::DOUBLE AS close FROM range({minutes}) a(m), range({symbols}) b(s) "
+        "ORDER BY random()"
+    )
+    return con
+
+
+def test_batches_follow_time_and_carry_watermark():
+    con = _kline_source(180)
+    source = _DuckSource(con)
+    lower, upper = datetime(2024, 1, 1, 0, 59), datetime(2024, 1, 1, 2, 30)
+    plan = build_plans(
+        catalog(["usdt_perp_1m"], {"usdt_perp_1m": kline_cols()}, {"usdt_perp_1m": wm(upper)}),
+        catalog(["usdt_perp_1m"], {"usdt_perp_1m": kline_cols()}, {"usdt_perp_1m": wm(lower)}),
+        None,
+    )[0]
+    batches = list(iter_batches(source, plan, 7))
+    previous = lower
+    rows = 0
+    for batch, through in batches:
+        times = batch.column("open_time").to_pylist()
+        assert times == sorted(times)
+        assert times[0] > previous          # no timestamp split across batches
+        assert through == times[-1]
+        previous = through
+        rows += batch.num_rows
+    assert previous == upper
+    assert rows == 91 * 5
+    assert len(batches) > 10
+
+
+class _DuckTarget:
+    """execute / transaction / append over an in-process DuckDB. ``fail_merge`` makes
+    that merge (1-based) fail, as a lost connection would."""
+
+    def __init__(self, con, fail_merge=None):
+        self.con = con
+        self.fail_merge = fail_merge
+        self.merges = 0
+
+    def execute(self, sql):
+        self.con.execute(sql)
+
+    def transaction(self, statements):
+        if any("ANTI JOIN" in sql for sql in statements):
+            self.merges += 1
+            if self.merges == self.fail_merge:
+                raise ConnectionError("connection lost")
+        self.con.execute("BEGIN")
+        try:
+            for sql in statements:
+                self.con.execute(sql)
+        except Exception:
+            self.con.execute("ROLLBACK")
+            raise
+        self.con.execute("COMMIT")
+
+    def append(self, schema, table, data):
+        self.con.register("_batch", data)
+        try:
+            self.con.execute(f'INSERT INTO {schema}."{table}" SELECT * FROM _batch')
+        finally:
+            self.con.unregister("_batch")
+
+
+def test_interrupted_sync_keeps_the_watermark_it_reached():
+    import contextlib
+    import io
+    import duckdb
+    import sync
+    source = _DuckSource(_kline_source(180))
+    lower, upper = datetime(2024, 1, 1, 0, 59), datetime(2024, 1, 1, 2, 59)
+    con = duckdb.connect()
+    con.execute("CREATE SCHEMA data")
+    con.execute("CREATE TABLE data.usdt_perp_1m (open_time TIMESTAMP NOT NULL, symbol VARCHAR NOT NULL, close DOUBLE)")
+    con.execute(
+        "INSERT INTO data.usdt_perp_1m SELECT TIMESTAMP '2024-01-01' + to_minutes(m::BIGINT), 'S' || s, m * 10 + s "
+        "FROM range(60) a(m), range(5) b(s) ORDER BY 1, 2"
+    )
+    con.execute(
+        "CREATE TABLE data.watermark (table_name VARCHAR PRIMARY KEY, ingestor VARCHAR, max_lag_seconds INTEGER, "
+        "time_column VARCHAR NOT NULL, start_time TIMESTAMP, duck_time TIMESTAMP, updated_at TIMESTAMP)"
+    )
+    con.execute("INSERT INTO data.watermark VALUES ('usdt_perp_1m', 'bn1m', 900, 'open_time', NULL, "
+                "TIMESTAMP '2024-01-01 00:59:00', NULL)")
+
+    def plan_now():
+        duck = con.execute("SELECT duck_time FROM data.watermark").fetchone()[0]
+        return build_plans(
+            catalog(["usdt_perp_1m"], {"usdt_perp_1m": kline_cols()}, {"usdt_perp_1m": wm(upper)}),
+            catalog(["usdt_perp_1m"], {"usdt_perp_1m": kline_cols()}, {"usdt_perp_1m": wm(duck, ingestor="bn1m")}),
+            None,
+        )[0]
+
+    sample = sync._sample_page_rows
+    sync._sample_page_rows = lambda *args: 10
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                apply_plan(source, _DuckTarget(con, fail_merge=4), plan_now())
+            except ConnectionError:
+                pass
+            else:
+                raise AssertionError("the fourth merge should have failed")
+            duck, ingestor = con.execute("SELECT duck_time, ingestor FROM data.watermark").fetchone()
+            # Three batches of two minutes each committed with their watermark.
+            assert duck == datetime(2024, 1, 1, 1, 5) and ingestor == "bn1m"
+            assert con.execute("SELECT max(open_time), count(*) FROM data.usdt_perp_1m").fetchone() == (duck, 66 * 5)
+            assert con.execute(
+                "SELECT count(*) FROM duckdb_tables() WHERE table_name LIKE '_sync_%'"
+            ).fetchone()[0] == 0
+
+            # The rerun starts from that watermark and finishes.
+            apply_plan(source, _DuckTarget(con), plan_now())
+    finally:
+        sync._sample_page_rows = sample
+    assert con.execute("SELECT duck_time FROM data.watermark").fetchone()[0] == upper
+    assert con.execute("SELECT count(*), count(DISTINCT (open_time, symbol)) FROM data.usdt_perp_1m").fetchone() == (
+        180 * 5, 180 * 5)
+    assert _backwards(con, "data.usdt_perp_1m", "open_time") == 0
+
+
 def main():
     test_flight_token_override()
     test_column_order_type_and_nulls()
@@ -485,6 +650,9 @@ def main():
     test_gap_after_target_watermark_is_rejected()
     test_retention_policy_is_not_copied()
     test_only_writers_of_synced_tables_are_stopped()
+    test_merge_writes_in_time_order()
+    test_batches_follow_time_and_carry_watermark()
+    test_interrupted_sync_keeps_the_watermark_it_reached()
     print("ok")
 
 
