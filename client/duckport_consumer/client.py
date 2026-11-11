@@ -67,13 +67,19 @@ def open_flight_client(addr: str, token: Optional[str] = None, **kwargs):
         kwargs["middleware"] = [_BearerFactory(resolved)]
     return flight.FlightClient(location, **kwargs)
 
-_KLINE_MARKETS = ("usdt_perp", "usdt_spot")
+# others_perp: USD-M perpetuals of every quote asset except USDT, in one table.
+# quote_volume there is in each symbol's own quote asset (data.exginfo.quote_asset).
+_KLINE_MARKETS = ("usdt_perp", "usdt_spot", "others_perp")
+_PERP_MARKETS = ("usdt_perp", "others_perp")
 _EQUITY_UNDERLYING_TYPES = ("EQUITY", "HK_EQUITY", "KR_EQUITY", "CN_EQUITY")
 _ASSET_CLASS_RE = re.compile(r"^[A-Za-z0-9_]+$")
+_ASSET_CLASS_MARKETS_ERROR = (
+    "asset_class is only supported for perp markets: " + ", ".join(_PERP_MARKETS)
+)
 
 
 def _asset_class_clause(asset_class: str) -> str:
-    """Extra exginfo predicate for an usdt_perp asset_class value.
+    """Extra exginfo predicate for a perp market's asset_class value.
 
     ``crypto`` / ``tradifi`` select contract types. ``EQUITY`` also includes
     HK, KR and CN equity. Any other value matches ``underlying_type`` exactly.
@@ -94,14 +100,21 @@ def _asset_class_clause(asset_class: str) -> str:
     return f"underlying_type = '{key}'"
 
 
-def usdt_perp_asset_where(asset_class: Optional[str] = None) -> str:
-    """WHERE fragment for data.exginfo rows of market usdt_perp."""
-    where = "market = 'usdt_perp'"
+def perp_asset_where(market: str, asset_class: Optional[str] = None) -> str:
+    """WHERE fragment for data.exginfo rows of a perp market."""
+    if market not in _PERP_MARKETS:
+        raise ValueError(_ASSET_CLASS_MARKETS_ERROR)
+    where = f"market = '{market}'"
     if asset_class is None:
         return where
     if not isinstance(asset_class, str):
         raise ValueError(f"Invalid asset_class: {asset_class!r}")
     return f"{where} AND {_asset_class_clause(asset_class)}"
+
+
+def usdt_perp_asset_where(asset_class: Optional[str] = None) -> str:
+    """WHERE fragment for data.exginfo rows of market usdt_perp."""
+    return perp_asset_where("usdt_perp", asset_class)
 
 
 def build_exginfo_sql(
@@ -112,12 +125,10 @@ def build_exginfo_sql(
     """SQL for get_exginfo. Omitting asset_class keeps the original statement."""
     if market not in _KLINE_MARKETS:
         raise ValueError(f"Unsupported market: {market}")
-    if asset_class is not None and market != "usdt_perp":
-        raise ValueError("asset_class is only supported for market 'usdt_perp'")
-    if market == "usdt_spot" or asset_class is None:
+    if asset_class is None:
         return f"SELECT * FROM {schema}.exginfo WHERE market = '{market}'"
     return (
-        f"SELECT * FROM {schema}.exginfo WHERE {usdt_perp_asset_where(asset_class)}"
+        f"SELECT * FROM {schema}.exginfo WHERE {perp_asset_where(market, asset_class)}"
     )
 
 
@@ -129,12 +140,10 @@ def _resample_extra_predicate(
     """Symbol predicate shared by the resample and its symbol-count query."""
     if asset_class is None:
         return None
-    if market != "usdt_perp":
-        raise ValueError("asset_class is only supported for market 'usdt_perp'")
     return (
         "symbol IN ("
         f"SELECT symbol FROM {schema}.exginfo "
-        f"WHERE {usdt_perp_asset_where(asset_class)}"
+        f"WHERE {perp_asset_where(market, asset_class)}"
         ")"
     )
 
@@ -153,7 +162,7 @@ def build_market_kline_sql(
     *,
     end_inclusive: bool = True,
 ) -> str:
-    """Resample SQL. asset_class filters usdt_perp symbols via exginfo.
+    """Resample SQL. asset_class filters a perp market's symbols via exginfo.
 
     ``end_inclusive`` is False on every chunk except the last. Those chunks
     stop on a resample-bucket boundary so a bucket is not split in half.
@@ -293,7 +302,7 @@ class DuckportConsumer:
         """Resample K-line data for all symbols in a market.
 
         Mirrors old FlightClient.get_market(). ``asset_class`` applies only to
-        ``usdt_perp``. Omit it to keep the original mixed result. ``crypto``
+        the perp markets (``usdt_perp``, ``others_perp``). Omit it to keep the original mixed result. ``crypto``
         and ``tradifi`` select contract types. ``EQUITY`` also includes HK, KR
         and CN equity. Other values match ``exginfo.underlying_type``.
 
@@ -334,7 +343,7 @@ class DuckportConsumer:
         """Fetch exchange info for a market.
 
         Mirrors old FlightClient.get_exginfo(). ``usdt_perp`` and ``usdt_spot``
-        without ``asset_class`` are unchanged. On ``usdt_perp``, ``asset_class``
+        without ``asset_class`` are unchanged. On a perp market, ``asset_class``
         restricts rows the same way as :meth:`get_market`.
         """
         return self.query(build_exginfo_sql(self._schema, market, asset_class))
