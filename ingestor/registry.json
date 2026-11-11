@@ -1,7 +1,7 @@
 {
   "binance-ingestor": {
     "repo": "https://github.com/sjmc-quant/duckport-binance-ingestor",
-    "description": "Binance Spot + USDT-Perp K-line ingestor",
+    "description": "Binance K-line ingestor: USDT spot + perp, or the other-quote perps (others_perp)",
     "exec": "binance-ingestor",
     "default_instance": "binance-5m",
     "config": [
