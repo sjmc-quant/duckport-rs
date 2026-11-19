@@ -2,8 +2,8 @@
 """Plugins register their table specs; duckport doctor reads them.
 
 Runs the real init_schema of binance-ingestor and binance-funding against the server,
-then checks that every registered spec parses and matches the built-in spec duckport-rs
-keeps for older plugin versions, and that doctor finds nothing to fix.
+then checks that every registered spec parses and agrees with the built-in spec duckport-rs
+keeps for older plugin versions (a newer plugin may add columns that have a default), and that doctor finds nothing to fix.
 
 Prerequisites:
   DUCKPORT_DB_PATH=/tmp/specs.db cargo run --bin duckport-server    (fresh database)
@@ -55,9 +55,14 @@ def main():
         assert spec.plugin == builtin.plugin and spec.kind == builtin.kind
         assert spec.dedup_key == builtin.dedup_key and spec.time_column == builtin.time_column
         assert spec.period == builtin.period, (name, spec.period, builtin.period)
-        assert set(spec.columns) == set(builtin.columns), (name, set(spec.columns) ^ set(builtin.columns))
+        # A newer plugin may add columns (binance-ingestor 0.7.0: contract_type / underlying_type
+        # on the perp tables). Each of them needs a default, so that rows written before it get a value.
+        assert set(builtin.columns) <= set(spec.columns), (name, set(builtin.columns) - set(spec.columns))
+        added = set(spec.columns) - set(builtin.columns)
+        assert added <= set(spec.column_defaults), (name, added - set(spec.column_defaults))
         assert spec.string_checks == builtin.string_checks, (name, spec.string_checks, builtin.string_checks)
-        assert spec.legacy_columns == builtin.legacy_columns and spec.column_defaults == builtin.column_defaults
+        assert spec.legacy_columns == builtin.legacy_columns
+        assert {k: v for k, v in spec.column_defaults.items() if k not in added} == builtin.column_defaults
 
     hr("doctor on freshly initialised plugin tables: nothing to fix")
     instances = [dict(NEW[0], instance="bn5m"), NEW[1]]
