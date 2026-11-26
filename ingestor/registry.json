@@ -233,4 +233,77 @@
       }
     ]
   }
+  "okx-ingestor": {
+    "repo": "https://github.com/sjmc-quant/duckport-okx-ingestor",
+    "description": "OKX USDT perpetual and spot K-line ingestor",
+    "exec": "okx-ingestor",
+    "default_instance": "okx-5m",
+    "config": [
+      {
+        "name": "INST_TYPE",
+        "label": "SWAP 或 SPOT",
+        "default": "SWAP"
+      },
+      {
+        "name": "KLINE_INTERVAL",
+        "label": "K 线周期",
+        "default": "5m"
+      },
+      {
+        "name": "CATEGORIES",
+        "label": "CATEGORIES",
+        "default": "all"
+      },
+      {
+        "name": "CONCURRENCY",
+        "label": "并发数",
+        "default": "8"
+      },
+      {
+        "name": "START_DATE",
+        "label": "START_DATE",
+        "default": "2021-01-01"
+      },
+      {
+        "name": "PROXY_URL",
+        "label": "PROXY_URL",
+        "default": "",
+        "empty_hint": "留空跳过"
+      }
+    ]
+  },
+  "okx-funding": {
+    "repo": "https://github.com/sjmc-quant/duckport-okx-funding",
+    "description": "OKX USDT perpetual funding-rate ingestor",
+    "exec": "okx-funding",
+    "default_instance": "okx-funding",
+    "config": [
+      {
+        "name": "CATEGORIES",
+        "label": "CATEGORIES",
+        "default": "all"
+      },
+      {
+        "name": "CONCURRENCY",
+        "label": "并发数",
+        "default": "4"
+      },
+      {
+        "name": "START_DATE",
+        "label": "START_DATE",
+        "default": "2021-01-01"
+      },
+      {
+        "name": "FUNDING_POLL_MINUTES",
+        "label": "资金费轮询分钟",
+        "default": "20"
+      },
+      {
+        "name": "PROXY_URL",
+        "label": "PROXY_URL",
+        "default": "",
+        "empty_hint": "留空跳过"
+      }
+    ]
+  }
 }
