@@ -213,6 +213,26 @@
       }
     ]
   },
+  "binance-listing": {
+    "repo": "https://github.com/sjmc-quant/duckport-binance-listing",
+    "description": "Binance spot listing-state events for USDT perps (5-minute sampling)",
+    "exec": "binance-listing",
+    "default_instance": "binance-listing",
+    "config": [
+      {
+        "name": "SPOT_QUOTES",
+        "label": "算作有现货的计价资产",
+        "default": "",
+        "empty_hint": "留空 = 任意计价"
+      },
+      {
+        "name": "PROXY_URL",
+        "label": "PROXY_URL",
+        "default": "",
+        "empty_hint": "留空跳过"
+      }
+    ]
+  }
   "okx-ingestor": {
     "repo": "https://github.com/sjmc-quant/duckport-okx-ingestor",
     "description": "OKX USDT perpetual and spot K-line ingestor",
