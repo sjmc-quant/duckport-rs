@@ -232,7 +232,7 @@
         "empty_hint": "留空跳过"
       }
     ]
-  }
+  },
   "okx-ingestor": {
     "repo": "https://github.com/sjmc-quant/duckport-okx-ingestor",
     "description": "OKX USDT perpetual and spot K-line ingestor",
