@@ -131,6 +131,14 @@ duckport-rs/
 | `duckport.ping` | `{}` | `{server, server_version, catalog, duckdb_version}` | 健康 + 版本探测 |
 | `duckport.execute` | `{"sql": "..."}` | `{"rows_affected": N}` | 单语句 DDL/DML |
 | `duckport.execute_transaction` | `{"statements": ["...", "..."]}` | `{"rows_affected": [N1, N2, ...]}` | 多语句原子执行（BEGIN/COMMIT；失败自动 ROLLBACK） |
+| `duckport.watch_watermark` | `{}` | 不结束的流，每条 `{"watermarks": [{table_name, duck_time}, ...]}` | 订阅 `data.watermark`，见下 |
+
+`duckport.watch_watermark` 用来代替轮询水位。连上立即收到当前全部水位，之后任意一张表的 `duck_time` 变化就再收到一次全量；15 秒没有变化时重发一次当前值，客户端据此判断连接还活着。`duck_time` 是 UTC，格式 `2026-01-01T00:05:00.000000`，没有水位时为 `null`。
+
+- 通知在写入事务提交之后发出，收到时对应的数据已经可以查询。
+- 流里是当前状态而不是事件队列：读得慢只会拿到最新值，断线重连先拿到当前值，不会漏。
+- 不占用读连接；同时最多 256 条订阅流。服务停止时流正常结束。
+- 只对本机和内网开放（公网来源只能调用 `duckport.ping`）。
 
 SQL 参数化尚未支持（计划中 Phase 2c），客户端需自行拼接字面量。
 
@@ -302,7 +310,12 @@ equities = c.get_market("usdt_perp", interval=60, asset_class="EQUITY")
 # 其他值按 underlying_type 精确匹配，例如 COMMODITY、FX、PREMARKET、COIN。
 gold = c.get_symbol("usdt_perp", "XAUUSDT", interval=60, asset_class="COMMODITY")
 info = c.get_exginfo("usdt_perp", asset_class="tradifi")
+
+# 等 usdt_perp_5m 的水位超过 last；服务端推送，不轮询。超时返回 None。
+duck_time = c.wait_duck_time("usdt_perp", after=last, timeout=120)
 ```
+
+`wait_duck_time(market, after=None, timeout=None)` 等的是 `data.watermark` 里 `{market}{suffix}` 这一行，返回带 UTC 时区的 `duck_time`；`after` 不带时区时按 UTC 处理，不传 `after` 时有水位就立即返回。服务端没有 `duckport.watch_watermark`（版本较早）时自动改为每秒查一次 `data.watermark`。需要同时看多张表时用 `watch_watermark()`，它逐条产出 `{table_name: duck_time}`。
 
 `asset_class` 只对合约市场（`usdt_perp`、`others_perp`）生效，`get_market`、`get_symbol`、`get_exginfo` 共用。`crypto` 对应 `contract_type='PERPETUAL'`，`tradifi` 对应 `TRADIFI_PERPETUAL`。`usdt_spot` 不能传这个参数。直接 `query()` 读 `usdt_perp_5m` 或 `usdt_perp_funding` 不会套用该过滤。
 

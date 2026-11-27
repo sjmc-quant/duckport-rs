@@ -81,7 +81,7 @@ jobs:
           BINANCE_INGESTOR_SRC: ${{ github.workspace }}/plugins/duckport-binance-ingestor
           BINANCE_FUNDING_SRC: ${{ github.workspace }}/plugins/duckport-binance-funding
           TAIL: "20"
-        run: tests/python/run_with_server.sh test_doctor.py test_upgrade.py test_table_specs.py test_retention.py
+        run: tests/python/run_with_server.sh test_doctor.py test_upgrade.py test_table_specs.py test_retention.py test_watch_watermark.py
 
       - name: Plugin unit tests (binance-funding)
         working-directory: plugins/duckport-binance-funding

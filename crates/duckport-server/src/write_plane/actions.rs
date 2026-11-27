@@ -33,6 +33,10 @@ pub fn advertised() -> Vec<(&'static str, &'static str)> {
             "duckport.retention_run",
             "Run data retention now ({\"table\"?, \"dry_run\"?})",
         ),
+        (
+            "duckport.watch_watermark",
+            "Stream data.watermark: the current state, then again after each duck_time change",
+        ),
     ]
 }
 
@@ -47,6 +51,10 @@ pub async fn handle(
     let kind = action.r#type.clone();
     debug!(action = %kind, body_len = action.body.len(), "duckport action");
     let body = action.body;
+
+    if kind == "duckport.watch_watermark" {
+        return Ok(Response::new(backend.watermarks().subscribe()?));
+    }
 
     let result_bytes = match kind.as_str() {
         "duckport.ping" => ping(backend, catalog_name).await.map_err(internal_err)?,

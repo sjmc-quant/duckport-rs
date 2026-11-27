@@ -12,9 +12,11 @@ mod backend;
 mod config;
 mod read_limit;
 mod retention;
+mod watermark;
 mod write_plane;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use airport::flight::Server as AirportServer;
 use anyhow::{Context, Result};
@@ -134,16 +136,25 @@ async fn main() -> Result<()> {
 
     // Bind only after DuckDB + schema are ready so clients never see a half-booted server.
     info!(%advertised, "duckport Flight service ready (airport read plane + duckport.* write plane)");
-    let mut builder = tonic::transport::Server::builder();
+    // HTTP/2 pings drop peers that vanished without closing, which matters for the
+    // long-lived `duckport.watch_watermark` streams.
+    let mut builder = tonic::transport::Server::builder()
+        .http2_keepalive_interval(Some(Duration::from_secs(30)))
+        .http2_keepalive_timeout(Some(Duration::from_secs(20)));
     if let Some(tls) = cfg.tls.clone() {
         let identity = tonic::transport::Identity::from_pem(tls.cert_pem, tls.key_pem);
         builder = builder
             .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))
             .context("configure TLS")?;
     }
+    let watermarks = backend.watermarks().clone();
     builder
         .add_service(flight_svc)
-        .serve_with_shutdown(cfg.listen_addr, shutdown_signal())
+        .serve_with_shutdown(cfg.listen_addr, async move {
+            shutdown_signal().await;
+            // Watch streams never finish on their own; end them so the drain can complete.
+            watermarks.close();
+        })
         .await
         .context("tonic transport")?;
 
