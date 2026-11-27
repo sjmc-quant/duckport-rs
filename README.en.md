@@ -132,6 +132,14 @@ All interfaces are exposed via standard Arrow Flight gRPC, default port `50051`.
 | `duckport.ping` | `{}` | `{server, server_version, catalog, duckdb_version}` | Health + version probe |
 | `duckport.execute` | `{"sql": "..."}` | `{"rows_affected": N}` | Single-statement DDL/DML |
 | `duckport.execute_transaction` | `{"statements": ["...", "..."]}` | `{"rows_affected": [N1, N2, ...]}` | Multi-statement atomic execution (BEGIN/COMMIT; auto ROLLBACK on failure) |
+| `duckport.watch_watermark` | `{}` | Endless stream of `{"watermarks": [{table_name, duck_time}, ...]}` | Subscribe to `data.watermark`, see below |
+
+`duckport.watch_watermark` replaces polling the watermark. The stream starts with all current watermarks and sends them again whenever the `duck_time` of any table changes. After 15 seconds without a change the current state is repeated, so a client can tell the connection is alive. `duck_time` is UTC, formatted `2026-01-01T00:05:00.000000`, or `null` when unset.
+
+- A message is sent after the write transaction commits, so the data is already readable.
+- The stream carries state, not an event queue: a slow reader gets only the latest values and a reconnect starts with the current ones, so nothing is missed.
+- It holds no read connection. At most 256 streams are open at once. Streams end when the server stops.
+- Loopback and LAN only (public peers may only call `duckport.ping`).
 
 SQL parameterization is not yet supported (planned for Phase 2c); clients must interpolate literals themselves.
 
@@ -300,7 +308,13 @@ equities = c.get_market("usdt_perp", interval=60, asset_class="EQUITY")
 # Any other value matches underlying_type exactly, e.g. COMMODITY, FX, PREMARKET, COIN.
 gold = c.get_symbol("usdt_perp", "XAUUSDT", interval=60, asset_class="COMMODITY")
 info = c.get_exginfo("usdt_perp", asset_class="tradifi")
+
+# Wait until the usdt_perp_5m watermark passes `last`. Pushed by the server, no polling.
+# Returns None on timeout.
+duck_time = c.wait_duck_time("usdt_perp", after=last, timeout=120)
 ```
+
+`wait_duck_time(market, after=None, timeout=None)` waits on the `{market}{suffix}` row of `data.watermark` and returns its `duck_time` as an aware UTC datetime. A naive `after` is taken as UTC; without `after` it returns as soon as the table has a watermark. Against a server without `duckport.watch_watermark` (older version) it polls `data.watermark` once a second instead. To follow several tables use `watch_watermark()`, which yields `{table_name: duck_time}`.
 
 `asset_class` applies only to the perp markets (`usdt_perp`, `others_perp`), on `get_market`, `get_symbol`, and `get_exginfo`. `crypto` selects `contract_type='PERPETUAL'`; `tradifi` selects `TRADIFI_PERPETUAL`. Do not pass it for `usdt_spot`. A raw `query()` against `usdt_perp_5m` or `usdt_perp_funding` is not filtered.
 

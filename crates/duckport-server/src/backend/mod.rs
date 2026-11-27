@@ -15,6 +15,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
 
+use crate::watermark::WatermarkHub;
+
 pub type ReadPool = Pool<DuckdbConnectionManager>;
 pub type ReadConn = r2d2::PooledConnection<DuckdbConnectionManager>;
 
@@ -35,6 +37,8 @@ struct BackendInner {
     /// `CatalogVersion.version` so DuckDB Airport clients refresh their cached catalog
     /// after DDL/DML without needing to DETACH/ATTACH.
     catalog_epoch: AtomicU64,
+    /// Last published `data.watermark`, refreshed after every write.
+    watermarks: WatermarkHub,
 }
 
 impl Backend {
@@ -117,6 +121,7 @@ impl Backend {
                 read_pool,
                 writer: Arc::new(Mutex::new(writer_conn)),
                 catalog_epoch: AtomicU64::new(1),
+                watermarks: WatermarkHub::default(),
             }),
         })
     }
@@ -133,6 +138,11 @@ impl Backend {
     /// and simpler than parsing SQL to decide.
     pub fn bump_catalog_epoch(&self) -> u64 {
         self.inner.catalog_epoch.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Watermark feed for `duckport.watch_watermark`.
+    pub fn watermarks(&self) -> &WatermarkHub {
+        &self.inner.watermarks
     }
 
     pub fn db_path(&self) -> &Path {
@@ -166,17 +176,26 @@ impl Backend {
     ///
     /// Calls serialise: only one writer closure executes at a time. Use this for any
     /// statement that mutates the catalog or data (INSERT/UPDATE/DELETE/DDL/BEGIN/COMMIT).
+    ///
+    /// The closure must commit or roll back before it returns. After a successful one
+    /// the watermark feed is refreshed under the same lock, so watchers are told about
+    /// a new `duck_time` only once its data is readable, and in commit order.
     pub async fn with_writer<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&mut duckdb::Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
         let writer = self.inner.writer.clone();
+        let watermarks = self.inner.watermarks.clone();
         tokio::task::spawn_blocking(move || {
             // `blocking_lock` is safe here because we're on the blocking thread pool,
             // never on a tokio worker.
             let mut guard = writer.blocking_lock();
-            f(&mut guard)
+            let out = f(&mut guard);
+            if out.is_ok() {
+                watermarks.refresh(&guard);
+            }
+            out
         })
         .await
         .context("duckdb writer task panicked")?

@@ -12,8 +12,9 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Iterator, Optional
 
 import pandas as pd
 import pyarrow as pa
@@ -27,6 +28,24 @@ from duckport_consumer.resample import (
 )
 
 logger = logging.getLogger("duckport_consumer")
+
+WATCH_WATERMARK_ACTION = "duckport.watch_watermark"
+# One watch call lasts at most this long, then it is reopened. A reopened stream starts
+# with the current watermarks, so nothing is missed and a dead connection cannot hang us.
+_WATCH_CALL_SECONDS = 60.0
+# Polling interval against servers that predate the watch action, and retry pause.
+_WATCH_POLL_SECONDS = 1.0
+
+
+def _utc(ts) -> Optional[datetime]:
+    """A duck_time (UTC wall clock) or a caller's datetime as an aware UTC datetime."""
+    if ts is None:
+        return None
+    if isinstance(ts, str):
+        ts = datetime.fromisoformat(ts)
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)
 
 
 def normalize_flight_location(addr: str) -> str:
@@ -245,6 +264,7 @@ class DuckportConsumer:
         self._redundancy_hours = redundancy_hours
         self._plan_a_hybrid_warned = False
         self._asset_columns: dict[str, bool] = {}
+        self._watch_supported = True
         logger.info("DuckportConsumer connected to %s", self._location)
         if pqt_path is not None or redundancy_hours != 1:
             self._log_plan_a_deprecation()
@@ -307,6 +327,78 @@ class DuckportConsumer:
         except Exception as e:
             logger.warning("Failed to read duck_time for %s: %s", market, e)
             return None
+
+    def watch_watermark(self, timeout: Optional[float] = None) -> Iterator[dict]:
+        """Subscribe to ``data.watermark`` via the duckport.watch_watermark DoAction.
+
+        Yields ``{table_name: duck_time}`` (aware UTC, None when unset): the current
+        state at once, then again after each duck_time change, and every 15 s when
+        nothing changes. ``timeout`` bounds the whole call in seconds and ends it with
+        ``FlightTimedOutError``. The stream also ends when the server shuts down.
+        """
+        options = flight.FlightCallOptions(timeout=timeout)
+        action = flight.Action(WATCH_WATERMARK_ACTION, b"")
+        for result in self._client.do_action(action, options=options):
+            message = json.loads(result.body.to_pybytes())
+            yield {w["table_name"]: _utc(w["duck_time"]) for w in message["watermarks"]}
+
+    def wait_duck_time(
+        self,
+        market: str,
+        after: Optional[datetime] = None,
+        timeout: Optional[float] = None,
+    ) -> Optional[datetime]:
+        """Block until the watermark of ``{market}{suffix}`` is later than ``after``.
+
+        Returns the new duck_time (aware UTC); its data is already readable. With
+        ``after=None`` the current duck_time is returned as soon as the table has one.
+        Returns None when ``timeout`` seconds pass first. A naive ``after`` is UTC.
+
+        The server pushes the change, so there is no polling delay. Against a server
+        without duckport.watch_watermark this polls ``data.watermark`` once a second.
+        """
+        table = f"{market}{self._suffix}"
+        after = _utc(after)
+        deadline = None if timeout is None else time.monotonic() + timeout
+
+        def left(cap: float) -> float:
+            return cap if deadline is None else min(cap, deadline - time.monotonic())
+
+        def reached(duck_time: Optional[datetime]) -> bool:
+            return duck_time is not None and (after is None or duck_time > after)
+
+        while left(1.0) > 0:
+            if not self._watch_supported:
+                duck_time = self._read_watermark(table)
+                if reached(duck_time):
+                    return duck_time
+                time.sleep(max(0.0, left(_WATCH_POLL_SECONDS)))
+                continue
+            try:
+                for watermarks in self.watch_watermark(timeout=left(_WATCH_CALL_SECONDS)):
+                    if reached(watermarks.get(table)):
+                        return watermarks[table]
+            except flight.FlightTimedOutError:
+                continue
+            except flight.FlightUnavailableError as e:
+                logger.warning("watermark watch lost (%s); reconnecting", e)
+            except pa.ArrowInvalid as e:
+                if "unknown duckport action" not in str(e):
+                    raise
+                logger.warning("server has no %s; polling data.watermark instead",
+                               WATCH_WATERMARK_ACTION)
+                self._watch_supported = False
+                continue
+            # the stream ended (server shutting down) or the server is unreachable
+            time.sleep(max(0.0, left(_WATCH_POLL_SECONDS)))
+        return None
+
+    def _read_watermark(self, table: str) -> Optional[datetime]:
+        result = self.query(
+            f"SELECT count(*) AS n, max(duck_time) AS duck_time "
+            f"FROM {self._schema}.watermark WHERE table_name = '{table}'"
+        )
+        return _utc(result.column("duck_time")[0].as_py())
 
     # ------------------------------------------------------------------
     # High-level query methods (compatible with old FlightClient)
